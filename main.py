@@ -21,7 +21,7 @@ if not BOT_TOKEN:
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DEV_MODE = os.getenv("DEV_MODE", "0") == "1"
-STARS_TO_CENTS = 2  # 1 Star = 2 cents -> 500 Stars = 1000 cents ($10.00)
+STARS_TO_CENTS = 1  # 1 Star = 2 cents -> 500 Stars = 1000 cents ($10.00)
 
 
 @asynccontextmanager
@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
     await db.close_db()
 
 
-app = FastAPI(title="ROYAL CASINO Mini App", lifespan=lifespan)
+app = FastAPI(title="T Casino Mini App", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
