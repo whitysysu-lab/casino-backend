@@ -21,7 +21,7 @@ if not BOT_TOKEN:
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 _raw_url = os.getenv("WEBAPP_URL", "https://casino-backend-gu9d.onrender.com").strip()
 WEBAPP_URL = _raw_url.split("](")[0].lstrip("[")
-STARS_TO_CENTS = 1  # 500 Telegram Stars = 1000 cents ($10.00)
+STARS_TO_CENTS = 1  # 100 Telegram Stars = 100 cents ($1.00)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -80,7 +80,7 @@ async def cmd_myid(message: Message):
 @dp.message(Command("topup"))
 async def cmd_topup(message: Message):
     await message.answer(
-        "Выберите пакет пополнения через Telegram Stars (500 ⭐ = $10):",
+        "Выберите пакет пополнения через Telegram Stars (100 ⭐ = $1):",
         reply_markup=topup_kb(),
     )
 
