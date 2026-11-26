@@ -2,7 +2,6 @@ import os
 import asyncpg
 
 _raw_db_url = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
-# Убираем channel_binding=require, так как asyncpg его не поддерживает
 if "channel_binding=" in _raw_db_url:
     base, _, query = _raw_db_url.partition("?")
     params = [p for p in query.split("&") if p and not p.startswith("channel_binding=")]
@@ -23,42 +22,40 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
                 username TEXT,
-                first_name TEXT,
-                balance DOUBLE PRECISION DEFAULT 0.0,
-                total_wagered DOUBLE PRECISION DEFAULT 0.0,
-                created_at TIMESTAMP DEFAULT NOW()
+                balance_cents BIGINT DEFAULT 0,
+                games_played INTEGER DEFAULT 0,
+                total_won_cents BIGINT DEFAULT 0
             );
         """)
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS bets (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT REFERENCES users(user_id),
-                game TEXT,
-                bet DOUBLE PRECISION,
-                payout DOUBLE PRECISION,
-                details TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
+            CREATE TABLE IF NOT EXISTS mines_games (
+                user_id BIGINT PRIMARY KEY,
+                bet_cents BIGINT,
+                mines_count INTEGER,
+                mines_positions TEXT,
+                revealed TEXT,
+                active INTEGER
             );
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id SERIAL PRIMARY KEY,
-                user_id BIGINT REFERENCES users(user_id),
-                amount DOUBLE PRECISION,
-                method TEXT,
-                wallet TEXT,
+                user_id BIGINT,
+                username TEXT,
+                amount_cents BIGINT,
+                details TEXT,
                 status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT NOW()
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS active_mines (
-                game_id TEXT PRIMARY KEY,
-                user_id BIGINT,
-                bet DOUBLE PRECISION,
-                mines_count INTEGER,
-                mines_json TEXT,
-                revealed_json TEXT
+            CREATE TABLE IF NOT EXISTS payments (
+                id SERIAL PRIMARY KEY,
+                charge_id TEXT UNIQUE NOT NULL,
+                user_id BIGINT NOT NULL,
+                stars INTEGER NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
 
