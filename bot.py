@@ -1,6 +1,5 @@
 import asyncio
 import os
-import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -13,52 +12,19 @@ from aiogram.types import (
     WebAppInfo,
 )
 
+import database as db
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://whitysysu-lab.github.io/casino/")
-DB_PATH = os.getenv("DB_PATH", "casino.db")
+_raw_url = os.getenv("WEBAPP_URL", "https://casino-backend-gu9d.onrender.com").strip()
+WEBAPP_URL = _raw_url.split("](")[0].lstrip("[")
 STARS_TO_CENTS = 2  # 500 Telegram Stars = 1000 cents ($10.00)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
-
-async def ensure_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                balance_cents INTEGER DEFAULT 0,
-                games_played INTEGER DEFAULT 0,
-                total_won_cents INTEGER DEFAULT 0
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS withdrawals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                amount_cents INTEGER,
-                details TEXT,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                charge_id TEXT UNIQUE NOT NULL,
-                user_id INTEGER NOT NULL,
-                stars INTEGER NOT NULL,
-                amount_cents INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.commit()
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -156,37 +122,33 @@ async def cb_handle_withdrawal(callback: CallbackQuery):
     wd_id = int(raw_id)
     new_status = "approved" if action == "wd_ok" else "rejected"
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM withdrawals WHERE id = ?", (wd_id,)) as cur:
-            wd = await cur.fetchone()
+    async with db.pool.acquire() as conn:
+        async with conn.transaction():
+            wd = await conn.fetchrow("SELECT * FROM withdrawals WHERE id = $1 FOR UPDATE", wd_id)
+            if not wd:
+                await callback.answer("Заявка не найдена", show_alert=True)
+                return
 
-        if not wd:
-            await callback.answer("Заявка не найдена", show_alert=True)
-            return
+            if wd["status"] != "pending":
+                await callback.answer("Заявка уже обработана", show_alert=True)
+                return
 
-        # Атомарное обновление статуса
-        upd = await db.execute(
-            "UPDATE withdrawals SET status = ? WHERE id = ? AND status = 'pending'",
-            (new_status, wd_id),
-        )
-        if upd.rowcount != 1:
-            await callback.answer("Заявка уже обработана", show_alert=True)
-            return
-
-        usd = round(wd["amount_cents"] / 100.0, 2)
-        if action == "wd_ok":
-            status_text = "✅ ОДОБРЕНО (выплачено)"
-            user_msg = f"✅ Ваша заявка на вывод #{wd_id} (${usd:.2f}) одобрена и выплачена!"
-        else:
-            await db.execute(
-                "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-                (wd["amount_cents"], wd["user_id"]),
+            await conn.execute(
+                "UPDATE withdrawals SET status = $1 WHERE id = $2",
+                new_status, wd_id,
             )
-            status_text = "❌ ОТКЛОНЕНО (средства возвращены)"
-            user_msg = f"❌ Ваша заявка на вывод #{wd_id} (${usd:.2f}) отклонена. Средства возвращены на баланс."
 
-        await db.commit()
+            usd = round(wd["amount_cents"] / 100.0, 2)
+            if action == "wd_ok":
+                status_text = "✅ ОДОБРЕНО (выплачено)"
+                user_msg = f"✅ Ваша заявка на вывод #{wd_id} (${usd:.2f}) одобрена и выплачена!"
+            else:
+                await conn.execute(
+                    "UPDATE users SET balance_cents = balance_cents + $1 WHERE user_id = $2",
+                    wd["amount_cents"], wd["user_id"],
+                )
+                status_text = "❌ ОТКЛОНЕНО (средства возвращены)"
+                user_msg = f"❌ Ваша заявка на вывод #{wd_id} (${usd:.2f}) отклонена. Средства возвращены на баланс."
 
     if callback.message and callback.message.text:
         await callback.message.edit_text(f"{callback.message.text}\n\nСтатус: {status_text}")
@@ -221,29 +183,29 @@ async def on_successful_payment(message: Message):
     usd = round(amount_cents / 100.0, 2)
     username = message.from_user.first_name or message.from_user.username or "Игрок"
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT OR IGNORE INTO payments (charge_id, user_id, stars, amount_cents) VALUES (?, ?, ?, ?)",
-            (charge_id, user_id, stars, amount_cents),
-        )
-        if cur.rowcount != 1:
-            # Защита от двойного зачисления
-            return
-
-        async with db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)) as ucur:
-            exists = await ucur.fetchone()
-
-        if exists:
-            await db.execute(
-                "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-                (amount_cents, user_id),
+    async with db.pool.acquire() as conn:
+        async with conn.transaction():
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO payments (charge_id, user_id, stars, amount_cents)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (charge_id) DO NOTHING
+                RETURNING id
+                """,
+                charge_id, user_id, stars, amount_cents,
             )
-        else:
-            await db.execute(
-                "INSERT INTO users (user_id, username, balance_cents, games_played, total_won_cents) VALUES (?, ?, ?, 0, 0)",
-                (user_id, username, amount_cents),
+            if not inserted:
+                return
+
+            await conn.execute(
+                """
+                INSERT INTO users (user_id, username, balance_cents, games_played, total_won_cents)
+                VALUES ($1, $2, $3, 0, 0)
+                ON CONFLICT (user_id) DO UPDATE
+                SET balance_cents = users.balance_cents + EXCLUDED.balance_cents
+                """,
+                user_id, username, amount_cents,
             )
-        await db.commit()
 
     await message.answer(
         f"✅ Оплата {stars} ⭐ прошла успешно!\nНа ваш баланс зачислено +${usd:.2f}.",
@@ -252,8 +214,11 @@ async def on_successful_payment(message: Message):
 
 
 async def main():
-    await ensure_db()
-    await dp.start_polling(bot)
+    await db.init_db()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await db.close_db()
 
 
 if __name__ == "__main__":
