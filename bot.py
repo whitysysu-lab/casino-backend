@@ -40,12 +40,12 @@ def topup_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="50 ⭐ (+$1)", callback_data="buy:50"),
-                InlineKeyboardButton(text="250 ⭐ (+$5)", callback_data="buy:250"),
+                InlineKeyboardButton(text="100 ⭐ (+$1)", callback_data="buy:100"),
+                InlineKeyboardButton(text="500 ⭐ (+$5)", callback_data="buy:500"),
             ],
             [
-                InlineKeyboardButton(text="500 ⭐ (+$10)", callback_data="buy:500"),
-                InlineKeyboardButton(text="2500 ⭐ (+$50)", callback_data="buy:2500"),
+                InlineKeyboardButton(text="1000 ⭐ (+$10)", callback_data="buy:1000"),
+                InlineKeyboardButton(text="5000 ⭐ (+$50)", callback_data="buy:5000"),
             ],
         ]
     )
@@ -54,8 +54,8 @@ def topup_kb() -> InlineKeyboardMarkup:
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "👑 Добро пожаловать в ROYAL CASINO!\n\n"
-        "• Валюта: $ (курс 500 ⭐ = $10)\n"
+        "👑 Добро пожаловать в T Casino!\n\n"
+        "• Валюта: $ (курс 100 ⭐ = $1)\n"
         "• Доступен демо-режим на $10 000\n\n"
         "Выберите действие:",
         reply_markup=main_menu_kb(),
@@ -89,7 +89,7 @@ async def cmd_topup(message: Message):
 async def cb_topup_menu(callback: CallbackQuery):
     if callback.message:
         await callback.message.answer(
-            "Выберите пакет пополнения через Telegram Stars (500 ⭐ = $10):",
+            "Выберите пакет пополнения через Telegram Stars (100 ⭐ = $1):",
             reply_markup=topup_kb(),
         )
     await callback.answer()
