@@ -21,7 +21,7 @@ if not BOT_TOKEN:
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 _raw_url = os.getenv("WEBAPP_URL", "https://casino-backend-gu9d.onrender.com").strip()
 WEBAPP_URL = _raw_url.split("](")[0].lstrip("[")
-STARS_TO_CENTS = 2  # 500 Telegram Stars = 1000 cents ($10.00)
+STARS_TO_CENTS = 1  # 500 Telegram Stars = 1000 cents ($10.00)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
