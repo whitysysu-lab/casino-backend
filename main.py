@@ -544,7 +544,7 @@ def play_crash(req: CrashRequest, user: dict = Depends(get_current_user)):
     if bet_cents <= 0 or user["balance_cents"] < bet_cents:
         raise HTTPException(status_code=400, detail="Недостаточно средств")
 
-    r = (secrets.randbelow(9999) + 1) / 10000.0
+    r = (secrets.randbelow(999999) + 1) / 1000000.0
     crash_point = max(1.0, round(0.97 / r, 2))
     is_win = crash_point >= req.target
     win_cents = int(round(bet_cents * req.target)) if is_win else 0
@@ -591,7 +591,7 @@ def play_wheel(req: BetRequest, user: dict = Depends(get_current_user)):
     if bet_cents <= 0 or user["balance_cents"] < bet_cents:
         raise HTTPException(status_code=400, detail="Недостаточно средств")
 
-    sectors = [0.0, 0.5, 1.5, 0.0, 2.0, 5.0, 10.0]
+    sectors = [0.0, 1.5, 0.0, 2.0, 0.5, 0.0, 1.0, 0.0, 1.5, 3.0]
     mult = secrets.choice(sectors)
     win_cents = int(round(bet_cents * mult))
     new_bal_cents = user["balance_cents"] - bet_cents + win_cents
