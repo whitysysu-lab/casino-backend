@@ -1,4 +1,5 @@
 import asyncio
+import html
 import os
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -30,7 +31,7 @@ dp = Dispatcher()
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎰 Открыть казино", web_app=WebAppInfo(url=WEBAPP_URL))],
+            [InlineKeyboardButton(text="🎰 Играть в T Casino", web_app=WebAppInfo(url=WEBAPP_URL))],
             [InlineKeyboardButton(text="⭐ Пополнить баланс", callback_data="topup_menu")],
         ]
     )
@@ -53,34 +54,61 @@ def topup_kb() -> InlineKeyboardMarkup:
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    await message.answer(
-        "👑 Добро пожаловать в T Casino!\n\n"
-        "• Валюта: $ (курс 100 ⭐ = $1)\n"
-        "• Доступен демо-режим на $10 000\n\n"
-        "Выберите действие:",
-        reply_markup=main_menu_kb(),
+    name = html.escape(message.from_user.first_name or "Игрок")
+    text = (
+        f"👑 <b>Добро пожаловать в T CASINO, {name}!</b>\n\n"
+        f"<blockquote>"
+        f"🎰 <b>20 топовых игр</b> — Краш, Плинко, Мины, Башня, Блэкджек 21, Европейская рулетка, Кейсы и др.\n"
+        f"🎁 <b>Демо-счёт на $10 000</b> — тестируй стратегии бесплатно.\n"
+        f"⭐ <b>Курс пополнения:</b> 100 Stars = $1.00 (мгновенно).\n"
+        f"💸 <b>Быстрый вывод</b> — от $1.00 на карту, TON или USDT."
+        f"</blockquote>\n\n"
+        f"👇 Жми кнопку ниже, чтобы открыть лобби:"
     )
+    await message.answer(text, parse_mode="HTML", reply_markup=main_menu_kb())
+
+
+@dp.message(Command("users"))
+async def cmd_users(message: Message):
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id, username, balance_cents, games_played FROM users ORDER BY balance_cents DESC LIMIT 40"
+        )
+        total = await conn.fetchrow("SELECT COUNT(*) AS cnt, COALESCE(SUM(balance_cents), 0) AS bal FROM users")
+
+    lines = [
+        f"👥 <b>Игроков в базе:</b> {total['cnt']}",
+        f"🏦 <b>Общий банк:</b> ${total['bal'] / 100:.2f}\n",
+    ]
+    for i, r in enumerate(rows, 1):
+        uname = html.escape(r["username"] or "Игрок")
+        lines.append(f"{i}. <b>{uname}</b> (<code>{r['user_id']}</code>) — <b>${r['balance_cents'] / 100:.2f}</b> ({r['games_played']} игр)")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("paysupport"))
 async def cmd_paysupport(message: Message):
     await message.answer(
-        "💬 Поддержка по платежам Telegram Stars:\n"
-        "Если возникла проблема с оплатой или зачислением, опишите ситуацию и укажите свой Telegram ID "
-        f"(`{message.from_user.id}`). Администратор проверит платёж по ID транзакции.",
-        parse_mode="Markdown",
+        "💬 <b>Поддержка по платежам Telegram Stars</b>\n"
+        "Если возникла проблема с оплатой или зачислением, опишите ситуацию и укажите свой Telegram ID: "
+        f"<code>{message.from_user.id}</code>.",
+        parse_mode="HTML",
     )
 
 
 @dp.message(Command("myid"))
 async def cmd_myid(message: Message):
-    await message.answer(f"Ваш Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
+    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
 
 
 @dp.message(Command("topup"))
 async def cmd_topup(message: Message):
     await message.answer(
-        "Выберите пакет пополнения через Telegram Stars (100 ⭐ = $1):",
+        "⭐ Выберите пакет пополнения через Telegram Stars (<b>100 ⭐ = $1</b>):",
+        parse_mode="HTML",
         reply_markup=topup_kb(),
     )
 
@@ -89,7 +117,8 @@ async def cmd_topup(message: Message):
 async def cb_topup_menu(callback: CallbackQuery):
     if callback.message:
         await callback.message.answer(
-            "Выберите пакет пополнения через Telegram Stars (100 ⭐ = $1):",
+            "⭐ Выберите пакет пополнения через Telegram Stars (<b>100 ⭐ = $1</b>):",
+            parse_mode="HTML",
             reply_markup=topup_kb(),
         )
     await callback.answer()
@@ -102,7 +131,7 @@ async def cb_buy_stars(callback: CallbackQuery):
 
     if callback.message:
         await callback.message.answer_invoice(
-            title=f"Пополнение: ${usd:.2f}",
+            title=f"Пополнение T Casino: ${usd:.2f}",
             description=f"Зачисление ${usd:.2f} на игровой баланс за {stars} Telegram Stars",
             payload=f"topup:{callback.from_user.id}:{stars}",
             provider_token="",
@@ -128,15 +157,11 @@ async def cb_handle_withdrawal(callback: CallbackQuery):
             if not wd:
                 await callback.answer("Заявка не найдена", show_alert=True)
                 return
-
             if wd["status"] != "pending":
                 await callback.answer("Заявка уже обработана", show_alert=True)
                 return
 
-            await conn.execute(
-                "UPDATE withdrawals SET status = $1 WHERE id = $2",
-                new_status, wd_id,
-            )
+            await conn.execute("UPDATE withdrawals SET status = $1 WHERE id = $2", new_status, wd_id)
 
             usd = round(wd["amount_cents"] / 100.0, 2)
             if action == "wd_ok":
@@ -199,8 +224,8 @@ async def on_successful_payment(message: Message):
 
             await conn.execute(
                 """
-                INSERT INTO users (user_id, username, balance_cents, games_played, total_won_cents)
-                VALUES ($1, $2, $3, 0, 0)
+                INSERT INTO users (user_id, username, balance_cents, games_played, total_wagered_cents, total_won_cents)
+                VALUES ($1, $2, $3, 0, 0, 0)
                 ON CONFLICT (user_id) DO UPDATE
                 SET balance_cents = users.balance_cents + EXCLUDED.balance_cents
                 """,
@@ -208,7 +233,8 @@ async def on_successful_payment(message: Message):
             )
 
     await message.answer(
-        f"✅ Оплата {stars} ⭐ прошла успешно!\nНа ваш баланс зачислено +${usd:.2f}.",
+        f"✅ Оплата <b>{stars} ⭐</b> прошла успешно!\nНа ваш баланс зачислено <b>+${usd:.2f}</b>.",
+        parse_mode="HTML",
         reply_markup=main_menu_kb(),
     )
 
