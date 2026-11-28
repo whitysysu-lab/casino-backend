@@ -1,5 +1,6 @@
 import asyncio
 import html
+import logging
 import os
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -15,14 +16,23 @@ from aiogram.types import (
 
 import database as db
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("tcasino.bot")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-_raw_url = os.getenv("WEBAPP_URL", "https://casino-backend-gu9d.onrender.com").strip()
-WEBAPP_URL = _raw_url.split("](")[0].lstrip("[")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().strip('"').strip("'")
+if not WEBAPP_URL:
+    raise RuntimeError("WEBAPP_URL environment variable is required")
+
 STARS_TO_CENTS = 1  # 100 Telegram Stars = 100 cents ($1.00)
+MAX_STARS_PURCHASE = 10000
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -52,6 +62,19 @@ def topup_kb() -> InlineKeyboardMarkup:
     )
 
 
+async def send_chunked_html(message: Message, lines: list[str], max_len: int = 3800):
+    buf = ""
+    for line in lines:
+        if len(buf) + len(line) + 1 > max_len:
+            if buf:
+                await message.answer(buf, parse_mode="HTML")
+            buf = line
+        else:
+            buf = f"{buf}\n{line}" if buf else line
+    if buf:
+        await message.answer(buf, parse_mode="HTML")
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     name = html.escape(message.from_user.first_name or "Игрок")
@@ -74,7 +97,7 @@ async def cmd_users(message: Message):
         return
     async with db.pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT user_id, username, balance_cents, games_played FROM users ORDER BY balance_cents DESC LIMIT 40"
+            "SELECT user_id, username, balance_cents, games_played FROM users ORDER BY balance_cents DESC LIMIT 50"
         )
         total = await conn.fetchrow("SELECT COUNT(*) AS cnt, COALESCE(SUM(balance_cents), 0) AS bal FROM users")
 
@@ -83,10 +106,13 @@ async def cmd_users(message: Message):
         f"🏦 <b>Общий банк:</b> ${total['bal'] / 100:.2f}\n",
     ]
     for i, r in enumerate(rows, 1):
-        uname = html.escape(r["username"] or "Игрок")
-        lines.append(f"{i}. <b>{uname}</b> (<code>{r['user_id']}</code>) — <b>${r['balance_cents'] / 100:.2f}</b> ({r['games_played']} игр)")
+        uname = html.escape((r["username"] or "Игрок")[:40])
+        lines.append(
+            f"{i}. <b>{uname}</b> (<code>{r['user_id']}</code>) — "
+            f"<b>${r['balance_cents'] / 100:.2f}</b> ({r['games_played']} игр)"
+        )
 
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await send_chunked_html(message, lines)
 
 
 @dp.message(Command("paysupport"))
@@ -126,9 +152,16 @@ async def cb_topup_menu(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("buy:"))
 async def cb_buy_stars(callback: CallbackQuery):
-    stars = int(callback.data.split(":")[1])
-    usd = round((stars * STARS_TO_CENTS) / 100.0, 2)
+    try:
+        stars = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Некорректная сумма", show_alert=True)
+        return
+    if stars < 1 or stars > MAX_STARS_PURCHASE:
+        await callback.answer("Недопустимая сумма Stars", show_alert=True)
+        return
 
+    usd = round((stars * STARS_TO_CENTS) / 100.0, 2)
     if callback.message:
         await callback.message.answer_invoice(
             title=f"Пополнение T Casino: ${usd:.2f}",
@@ -147,46 +180,49 @@ async def cb_handle_withdrawal(callback: CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True)
         return
 
-    action, raw_id = callback.data.split(":")
-    wd_id = int(raw_id)
-    new_status = "approved" if action == "wd_ok" else "rejected"
+    try:
+        raw_action, raw_id = callback.data.split(":")
+        wd_id = int(raw_id)
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный ID заявки", show_alert=True)
+        return
 
-    async with db.pool.acquire() as conn:
-        async with conn.transaction():
-            wd = await conn.fetchrow("SELECT * FROM withdrawals WHERE id = $1 FOR UPDATE", wd_id)
-            if not wd:
-                await callback.answer("Заявка не найдена", show_alert=True)
-                return
-            if wd["status"] != "pending":
-                await callback.answer("Заявка уже обработана", show_alert=True)
-                return
-
-            await conn.execute("UPDATE withdrawals SET status = $1 WHERE id = $2", new_status, wd_id)
-
-            usd = round(wd["amount_cents"] / 100.0, 2)
-            if action == "wd_ok":
-                status_text = "✅ ОДОБРЕНО (выплачено)"
-                user_msg = f"✅ Ваша заявка на вывод #{wd_id} (${usd:.2f}) одобрена и выплачена!"
-            else:
-                await conn.execute(
-                    "UPDATE users SET balance_cents = balance_cents + $1 WHERE user_id = $2",
-                    wd["amount_cents"], wd["user_id"],
-                )
-                status_text = "❌ ОТКЛОНЕНО (средства возвращены)"
-                user_msg = f"❌ Ваша заявка на вывод #{wd_id} (${usd:.2f}) отклонена. Средства возвращены на баланс."
+    action = "approve" if raw_action == "wd_ok" else "reject"
+    res = await db.handle_withdrawal_decision(wd_id, action)
+    if not res["ok"]:
+        await callback.answer(res["error"], show_alert=True)
+        return
 
     if callback.message and callback.message.text:
-        await callback.message.edit_text(f"{callback.message.text}\n\nСтатус: {status_text}")
+        try:
+            await callback.message.edit_text(f"{callback.message.text}\n\nСтатус: {res['status_text']}")
+        except Exception as exc:
+            logger.warning("Failed to edit admin withdrawal message #%s: %s", wd_id, exc)
 
     try:
-        await bot.send_message(wd["user_id"], user_msg)
-    except Exception:
-        pass
+        await bot.send_message(res["user_id"], res["user_msg"])
+    except Exception as exc:
+        logger.warning("Failed to notify user %s about withdrawal #%s: %s", res["user_id"], wd_id, exc)
+
     await callback.answer("Готово")
 
 
 @dp.pre_checkout_query()
 async def on_pre_checkout(query: PreCheckoutQuery):
+    if query.currency != "XTR":
+        await query.answer(ok=False, error_message="Поддерживается только оплата в Telegram Stars (XTR).")
+        return
+
+    stars = query.total_amount
+    expected_payload = f"topup:{query.from_user.id}:{stars}"
+    if stars < 1 or stars > MAX_STARS_PURCHASE or query.invoice_payload != expected_payload:
+        logger.warning(
+            "Rejected pre_checkout_query user=%s stars=%s payload=%s",
+            query.from_user.id, stars, query.invoice_payload,
+        )
+        await query.answer(ok=False, error_message="Некорректные параметры счёта. Попробуйте создать его заново.")
+        return
+
     await query.answer(ok=True)
 
 
@@ -200,6 +236,7 @@ async def on_successful_payment(message: Message):
     stars = payment.total_amount
     expected_payload = f"topup:{user_id}:{stars}"
     if payment.invoice_payload != expected_payload:
+        logger.error("Payload mismatch on successful_payment user=%s payload=%s", user_id, payment.invoice_payload)
         await message.answer("⚠️ Ошибка проверки платежа. Обратитесь в /paysupport.")
         return
 
@@ -222,14 +259,24 @@ async def on_successful_payment(message: Message):
             if not inserted:
                 return
 
-            await conn.execute(
+            u_row = await conn.fetchrow(
                 """
                 INSERT INTO users (user_id, username, balance_cents, games_played, total_wagered_cents, total_won_cents)
                 VALUES ($1, $2, $3, 0, 0, 0)
                 ON CONFLICT (user_id) DO UPDATE
-                SET balance_cents = users.balance_cents + EXCLUDED.balance_cents
+                SET balance_cents = users.balance_cents + EXCLUDED.balance_cents,
+                    username = EXCLUDED.username
+                RETURNING balance_cents
                 """,
                 user_id, username, amount_cents,
+            )
+            await db.log_transaction(
+                conn,
+                user_id,
+                "deposit_stars",
+                amount_cents,
+                int(u_row["balance_cents"]),
+                f"stars={stars}:charge={charge_id}",
             )
 
     await message.answer(
@@ -242,8 +289,10 @@ async def on_successful_payment(message: Message):
 async def main():
     await db.init_db()
     try:
+        logger.info("Starting T Casino bot polling...")
         await dp.start_polling(bot)
     finally:
+        await bot.session.close()
         await db.close_db()
 
 
