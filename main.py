@@ -1,21 +1,30 @@
+import collections
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
+import re
 import secrets
 import time
-import urllib.request
 from contextlib import asynccontextmanager
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlparse
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+import aiohttp
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import database as db
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("tcasino.api")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -25,27 +34,83 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DEV_MODE = os.getenv("DEV_MODE", "0") == "1"
 STARS_TO_CENTS = 1  # 100 Stars = 100 cents ($1.00)
 CRASH_SPEED = 0.12  # mult(t) = exp(0.12 * t)
+MAX_BET_USD = float(os.getenv("MAX_BET_USD", "100.0"))
+MAX_WIN_USD = float(os.getenv("MAX_WIN_USD", "1000.0"))
+MAX_BET_CENTS = int(round(MAX_BET_USD * 100))
+MAX_WIN_CENTS = int(round(MAX_WIN_USD * 100))
+INIT_DATA_MAX_AGE = int(os.getenv("INIT_DATA_MAX_AGE", "86400"))  # 24 часа
+MAX_PENDING_WITHDRAWALS = int(os.getenv("MAX_PENDING_WITHDRAWALS", "2"))
+
+http_session: aiohttp.ClientSession | None = None
+
+
+def _build_allowed_origins() -> list[str]:
+    origins: list[str] = []
+    raw_list = [os.getenv("WEBAPP_URL", "")] + os.getenv("ALLOWED_ORIGINS", "").split(",")
+    for item in raw_list:
+        val = item.strip().strip('"').strip("'")
+        if not val:
+            continue
+        parsed = urlparse(val)
+        if parsed.scheme and parsed.netloc:
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            if origin not in origins:
+                origins.append(origin)
+    return origins
+
+
+ALLOWED_ORIGINS = _build_allowed_origins()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global http_session
     await db.init_db()
-    yield
-    await db.close_db()
+    http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+    try:
+        yield
+    finally:
+        if http_session:
+            await http_session.close()
+            http_session = None
+        await db.close_db()
 
 
-app = FastAPI(title="T Casino Mini App v2.0", lifespan=lifespan)
+app = FastAPI(title="T Casino Mini App v2.1", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Telegram-Init-Data"],
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
+
 
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# --- Лёгкий per-user rate limiter (sliding window) ---
+_rate_buckets: dict[tuple[str, int], collections.deque[float]] = collections.defaultdict(collections.deque)
+
+
+def check_rate_limit(scope: str, user_id: int, limit: int, window_sec: float):
+    now = time.monotonic()
+    q = _rate_buckets[(scope, user_id)]
+    while q and now - q[0] > window_sec:
+        q.popleft()
+    if len(q) >= limit:
+        raise HTTPException(status_code=429, detail="Слишком много запросов. Подождите пару секунд.")
+    q.append(now)
 
 
 def to_cents(dollars: float) -> int:
@@ -56,21 +121,48 @@ def to_dollars(cents: int) -> float:
     return round(cents / 100.0, 2)
 
 
-def send_tg_message(chat_id: int, text: str, reply_markup: dict | None = None):
+def validate_bet_cents(dollars: float) -> int:
+    bet_cents = to_cents(dollars)
+    if bet_cents <= 0:
+        raise HTTPException(status_code=400, detail="Некорректная ставка")
+    if bet_cents > MAX_BET_CENTS:
+        raise HTTPException(status_code=400, detail=f"Максимальная ставка — ${MAX_BET_USD:.2f}")
+    return bet_cents
+
+
+def cap_win(win_cents: int) -> int:
+    return min(max(0, int(win_cents)), MAX_WIN_CENTS)
+
+
+CARD_RANK_RE = re.compile(r"^(10|[2-9JQKA])")
+
+
+def parse_card_rank(card: str) -> str:
+    m = CARD_RANK_RE.match(str(card or ""))
+    return m.group(1) if m else "0"
+
+
+async def send_tg_message(chat_id: int, text: str, reply_markup: dict | None = None) -> bool:
+    if not http_session:
+        logger.warning("HTTP session is not initialized; skipping Telegram message")
+        return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    body = {"chat_id": chat_id, "text": text}
+    body: dict = {"chat_id": chat_id, "text": text}
     if reply_markup:
         body["reply_markup"] = reply_markup
-    payload = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=8):
-            pass
-    except Exception:
-        pass
+        async with http_session.post(url, json=body) as resp:
+            if resp.status != 200:
+                err_body = await resp.text()
+                logger.warning("Telegram sendMessage failed (%s): %s", resp.status, err_body[:200])
+                return False
+            return True
+    except Exception as exc:
+        logger.warning("Telegram sendMessage network error: %s", type(exc).__name__)
+        return False
 
 
-def notify_admin_withdrawal(wd_id: int, user_id: int, username: str, amount_cents: int, details: str):
+async def notify_admin_withdrawal(wd_id: int, user_id: int, username: str, amount_cents: int, details: str):
     if not ADMIN_ID:
         return
     text = (
@@ -85,12 +177,16 @@ def notify_admin_withdrawal(wd_id: int, user_id: int, username: str, amount_cent
             {"text": "❌ Отклонить", "callback_data": f"wd_no:{wd_id}"},
         ]]
     }
-    send_tg_message(ADMIN_ID, text, reply_markup=markup)
+    await send_tg_message(ADMIN_ID, text, reply_markup=markup)
 
 
-# --- Авторизация Telegram WebApp ---
+# --- Авторизация Telegram WebApp (HMAC-SHA256 + auth_date) ---
 def verify_telegram_init_data(init_data: str) -> dict:
-    parsed = dict(parse_qsl(init_data, strict_parsing=True))
+    try:
+        parsed = dict(parse_qsl(init_data, strict_parsing=True))
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Malformed initData")
+
     received_hash = parsed.pop("hash", None)
     if not received_hash:
         raise HTTPException(status_code=401, detail="Missing hash")
@@ -104,10 +200,21 @@ def verify_telegram_init_data(init_data: str) -> dict:
     if not hmac.compare_digest(calculated_hash, received_hash):
         raise HTTPException(status_code=401, detail="Invalid Telegram signature")
 
+    raw_auth_date = parsed.get("auth_date")
+    if not raw_auth_date or not raw_auth_date.isdigit():
+        raise HTTPException(status_code=401, detail="Missing auth_date")
+    auth_date = int(raw_auth_date)
+    now = time.time()
+    if now - auth_date > INIT_DATA_MAX_AGE or auth_date - now > 300:
+        raise HTTPException(status_code=401, detail="Сессия Telegram устарела. Переоткройте приложение.")
+
     user_raw = parsed.get("user")
     if not user_raw:
         raise HTTPException(status_code=401, detail="Missing user data")
-    return json.loads(user_raw)
+    try:
+        return json.loads(user_raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=401, detail="Invalid user payload")
 
 
 async def get_current_user(x_telegram_init_data: str | None = Header(default=None)) -> dict:
@@ -124,13 +231,14 @@ async def get_current_user(x_telegram_init_data: str | None = Header(default=Non
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
         if not row:
+            initial_card = secrets.randbelow(11) + 3
             await conn.execute(
                 """
-                INSERT INTO users (user_id, username, balance_cents, games_played, total_wagered_cents, total_won_cents)
-                VALUES ($1, $2, 0, 0, 0, 0)
+                INSERT INTO users (user_id, username, balance_cents, games_played, total_wagered_cents, total_won_cents, hilo_card)
+                VALUES ($1, $2, 0, 0, 0, 0, $3)
                 ON CONFLICT (user_id) DO NOTHING
                 """,
-                user_id, username,
+                user_id, username, initial_card,
             )
             row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
         elif row["username"] != username:
@@ -139,25 +247,44 @@ async def get_current_user(x_telegram_init_data: str | None = Header(default=Non
         return dict(row)
 
 
-async def settle_instant_game(user_id: int, bet_cents: int, win_cents: int) -> int:
-    if bet_cents <= 0:
-        raise HTTPException(status_code=400, detail="Некорректная ставка")
+async def settle_instant_game(
+    user_id: int,
+    bet_cents: int,
+    win_cents: int,
+    game_name: str,
+) -> tuple[int, int]:
+    """Атомарно списывает ставку, начисляет выигрыш и пишет запись в ledger за 1 SQL round-trip."""
+    check_rate_limit("play", user_id, limit=45, window_sec=10.0)
+    capped_win = cap_win(win_cents)
+    net_cents = capped_win - bet_cents
+    meta = f"{game_name}:bet={bet_cents}:win={capped_win}"
+
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            UPDATE users
-            SET balance_cents = balance_cents - $1 + $2,
-                games_played = games_played + 1,
-                total_wagered_cents = total_wagered_cents + $1,
-                total_won_cents = total_won_cents + $2
-            WHERE user_id = $3 AND balance_cents >= $1
-            RETURNING balance_cents
+            WITH updated AS (
+                UPDATE users
+                SET balance_cents = balance_cents - $1 + $2,
+                    games_played = games_played + 1,
+                    total_wagered_cents = total_wagered_cents + $1,
+                    total_won_cents = total_won_cents + $2
+                WHERE user_id = $3 AND balance_cents >= $1
+                RETURNING balance_cents
+            )
+            INSERT INTO transactions (user_id, kind, amount_cents, balance_after_cents, meta)
+            SELECT $3, $4, $5, balance_cents, $6 FROM updated
+            RETURNING balance_after_cents
             """,
-            bet_cents, win_cents, user_id,
+            bet_cents,
+            capped_win,
+            user_id,
+            f"play_{game_name}",
+            net_cents,
+            meta,
         )
         if not row:
             raise HTTPException(status_code=400, detail="Недостаточно средств. Пополните баланс в Кассе!")
-        return int(row["balance_cents"])
+        return int(row["balance_after_cents"]), capped_win
 
 
 def mines_multiplier(mines_count: int, revealed_count: int) -> float:
@@ -196,9 +323,58 @@ def draw_crash_point() -> float:
     return 1.0 if val < 1.01 else round(min(val, 1000.0), 2)
 
 
+async def settle_crash_if_ended(conn, game) -> dict | None:
+    """
+    Единая проверка завершения активного полёта Краша (вызывается внутри транзакции с FOR UPDATE).
+    Гарантирует выплату сработавшего auto_cashout даже если игрок свернул Telegram или пропала сеть.
+    Возвращает словарь результата, если полёт завершён, или None, если ракета ещё летит.
+    """
+    uid = int(game["user_id"])
+    now_mult = crash_current_mult(game["started_at"])
+    auto_c = float(game["auto_cashout"] or 0.0)
+    cp = float(game["crash_point"])
+
+    if auto_c >= 1.05 and now_mult >= auto_c and auto_c <= cp:
+        win_cents = cap_win(int(round(game["bet_cents"] * auto_c)))
+        u_row = await conn.fetchrow(
+            """
+            UPDATE users
+            SET balance_cents = balance_cents + $1,
+                total_won_cents = total_won_cents + $1
+            WHERE user_id = $2
+            RETURNING balance_cents
+            """,
+            win_cents,
+            uid,
+        )
+        new_bal = int(u_row["balance_cents"])
+        await db.log_transaction(conn, uid, "crash_auto_win", win_cents, new_bal, f"mult={auto_c}")
+        await conn.execute("UPDATE crash_games SET active = 0 WHERE user_id = $1", uid)
+        return {
+            "status": "cashed_out",
+            "multiplier": auto_c,
+            "crash_point": cp,
+            "win": to_dollars(win_cents),
+            "balance": to_dollars(new_bal),
+        }
+
+    if now_mult >= cp:
+        await conn.execute("UPDATE crash_games SET active = 0 WHERE user_id = $1", uid)
+        u_row = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1", uid)
+        return {
+            "status": "crashed",
+            "multiplier": cp,
+            "crash_point": cp,
+            "win": 0.0,
+            "balance": to_dollars(int(u_row["balance_cents"])),
+        }
+
+    return None
+
+
 # --- Модели запросов ---
 class BetRequest(BaseModel):
-    bet: float = Field(gt=0, le=100000)
+    bet: float = Field(gt=0, le=MAX_BET_USD)
 
 
 class CoinflipRequest(BetRequest):
@@ -228,7 +404,6 @@ class RouletteRequest(BetRequest):
 
 
 class HiloRequest(BetRequest):
-    current_card: int = Field(ge=2, le=14)
     guess: str = Field(pattern="^(high|low)$")
 
 
@@ -293,12 +468,40 @@ def serve_index():
     return FileResponse("static/index.html")
 
 
+@app.get("/health")
+async def health_check():
+    try:
+        async with db.pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return {"status": "ok"}
+    except Exception as exc:
+        logger.error("Health check DB failure: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+
 @app.get("/api/me")
 async def api_me(user: dict = Depends(get_current_user)):
     uid = user["user_id"]
+    active_crash = None
+
     async with db.pool.acquire() as conn:
+        # Сначала корректно закрываем завершённый Краш (с выплатой auto_cashout!)
+        async with conn.transaction():
+            crash_row = await conn.fetchrow(
+                "SELECT * FROM crash_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
+            )
+            if crash_row:
+                settled = await settle_crash_if_ended(conn, crash_row)
+                if not settled:
+                    active_crash = {
+                        "bet": to_dollars(crash_row["bet_cents"]),
+                        "auto_cashout": crash_row["auto_cashout"],
+                        "started_at": crash_row["started_at"],
+                        "multiplier": crash_current_mult(crash_row["started_at"]),
+                    }
+
+        fresh_user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", uid)
         mines_row = await conn.fetchrow("SELECT * FROM mines_games WHERE user_id = $1 AND active = 1", uid)
-        crash_row = await conn.fetchrow("SELECT * FROM crash_games WHERE user_id = $1 AND active = 1", uid)
         tower_row = await conn.fetchrow("SELECT * FROM tower_games WHERE user_id = $1 AND active = 1", uid)
         bj_row = await conn.fetchrow("SELECT * FROM blackjack_games WHERE user_id = $1 AND active = 1", uid)
         wd_rows = await conn.fetch(
@@ -310,37 +513,25 @@ async def api_me(user: dict = Depends(get_current_user)):
     if mines_row:
         revealed = json.loads(mines_row["revealed"])
         mult = mines_multiplier(mines_row["mines_count"], len(revealed))
+        potential_cents = cap_win(int(round(mines_row["bet_cents"] * mult)))
         active_mines = {
             "bet": to_dollars(mines_row["bet_cents"]),
             "mines_count": mines_row["mines_count"],
             "revealed": revealed,
             "multiplier": mult,
-            "potential_win": to_dollars(int(round(mines_row["bet_cents"] * mult))),
+            "potential_win": to_dollars(potential_cents),
         }
-
-    active_crash = None
-    if crash_row:
-        now_mult = crash_current_mult(crash_row["started_at"])
-        if now_mult < crash_row["crash_point"]:
-            active_crash = {
-                "bet": to_dollars(crash_row["bet_cents"]),
-                "auto_cashout": crash_row["auto_cashout"],
-                "started_at": crash_row["started_at"],
-                "multiplier": now_mult,
-            }
-        else:
-            async with db.pool.acquire() as conn:
-                await conn.execute("UPDATE crash_games SET active = 0 WHERE user_id = $1", uid)
 
     active_tower = None
     if tower_row:
         mult = tower_multiplier(tower_row["difficulty"], tower_row["floor"])
+        potential_cents = cap_win(int(round(tower_row["bet_cents"] * mult)))
         active_tower = {
             "bet": to_dollars(tower_row["bet_cents"]),
             "difficulty": tower_row["difficulty"],
             "floor": tower_row["floor"],
             "multiplier": mult,
-            "potential_win": to_dollars(int(round(tower_row["bet_cents"] * mult))),
+            "potential_win": to_dollars(potential_cents),
         }
 
     active_blackjack = None
@@ -355,12 +546,18 @@ async def api_me(user: dict = Depends(get_current_user)):
             "dealer_visible_score": bj_score([d_hand[0]]),
         }
 
+    hilo_card = int(fresh_user["hilo_card"] or 7)
+    if hilo_card < 2 or hilo_card > 14:
+        hilo_card = 7
+
     return {
         "user_id": uid,
-        "username": user["username"],
-        "balance": to_dollars(user["balance_cents"]),
-        "games_played": user["games_played"],
-        "total_won": to_dollars(user["total_won_cents"]),
+        "username": fresh_user["username"],
+        "balance": to_dollars(fresh_user["balance_cents"]),
+        "games_played": fresh_user["games_played"],
+        "total_won": to_dollars(fresh_user["total_won_cents"]),
+        "hilo_card": hilo_card,
+        "limits": {"max_bet": MAX_BET_USD, "max_win": MAX_WIN_USD},
         "active_mines": active_mines,
         "active_crash": active_crash,
         "active_tower": active_tower,
@@ -374,14 +571,14 @@ async def api_me(user: dict = Depends(get_current_user)):
 
 
 @app.get("/api/leaderboard")
-async def api_leaderboard():
+async def api_leaderboard(user: dict = Depends(get_current_user)):
     async with db.pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT username, total_won_cents, games_played, balance_cents
+            SELECT username, total_won_cents, games_played
             FROM users
             WHERE games_played > 0 OR total_won_cents > 0
-            ORDER BY total_won_cents DESC, balance_cents DESC
+            ORDER BY total_won_cents DESC, games_played DESC
             LIMIT 15
             """
         )
@@ -391,7 +588,6 @@ async def api_leaderboard():
                 "username": r["username"] or "Игрок",
                 "total_won": to_dollars(r["total_won_cents"]),
                 "games_played": r["games_played"],
-                "balance": to_dollars(r["balance_cents"]),
             }
             for r in rows
         ]
@@ -400,54 +596,85 @@ async def api_leaderboard():
 
 @app.post("/api/withdraw")
 async def api_withdraw(req: WithdrawRequest, user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
+    check_rate_limit("withdraw", uid, limit=5, window_sec=60.0)
+
     amount_cents = to_cents(req.amount)
     details = req.details.strip()
     if amount_cents < 100:
         raise HTTPException(status_code=400, detail="Минимальная сумма вывода — $1.00")
+    if len(details) < 3:
+        raise HTTPException(status_code=400, detail="Укажите корректные реквизиты")
 
     async with db.pool.acquire() as conn:
         async with conn.transaction():
-            row = await conn.fetchrow(
-                "UPDATE users SET balance_cents = balance_cents - $1 WHERE user_id = $2 AND balance_cents >= $1 RETURNING balance_cents",
-                amount_cents, user["user_id"],
-            )
-            if not row:
+            u_lock = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1 FOR UPDATE", uid)
+            if not u_lock or int(u_lock["balance_cents"]) < amount_cents:
                 raise HTTPException(status_code=400, detail="Недостаточно средств на балансе")
 
+            pending_cnt = await conn.fetchval(
+                "SELECT COUNT(*) FROM withdrawals WHERE user_id = $1 AND status = 'pending'",
+                uid,
+            )
+            if pending_cnt >= MAX_PENDING_WITHDRAWALS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"У вас уже есть {pending_cnt} активные заявки на вывод. Дождитесь их обработки.",
+                )
+
+            row = await conn.fetchrow(
+                "UPDATE users SET balance_cents = balance_cents - $1 WHERE user_id = $2 RETURNING balance_cents",
+                amount_cents,
+                uid,
+            )
             wd_row = await conn.fetchrow(
                 "INSERT INTO withdrawals (user_id, username, amount_cents, details, status) VALUES ($1, $2, $3, $4, 'pending') RETURNING id",
-                user["user_id"], user["username"], amount_cents, details,
+                uid,
+                user["username"],
+                amount_cents,
+                details,
             )
-            wd_id = wd_row["id"]
-            new_bal_cents = row["balance_cents"]
+            wd_id = int(wd_row["id"])
+            new_bal_cents = int(row["balance_cents"])
+            await db.log_transaction(conn, uid, "withdraw_request", -amount_cents, new_bal_cents, f"wd:{wd_id}")
 
-    notify_admin_withdrawal(wd_id, user["user_id"], user["username"], amount_cents, details)
+    await notify_admin_withdrawal(wd_id, uid, user["username"], amount_cents, details)
     return {"id": wd_id, "balance": to_dollars(new_bal_cents), "status": "pending"}
 
 
 @app.post("/api/stars/invoice")
-def create_stars_invoice(req: StarsInvoiceRequest, user: dict = Depends(get_current_user)):
+async def create_stars_invoice(req: StarsInvoiceRequest, user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
+    check_rate_limit("invoice", uid, limit=10, window_sec=60.0)
+
+    if not http_session:
+        raise HTTPException(status_code=503, detail="Сервис временно недоступен")
+
     amount_cents = req.stars * STARS_TO_CENTS
     usd = to_dollars(amount_cents)
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/createInvoiceLink"
-    payload = json.dumps({
+    payload = {
         "title": f"Пополнение T Casino: ${usd:.2f}",
         "description": f"Зачисление ${usd:.2f} на баланс за {req.stars} Telegram Stars",
-        "payload": f"topup:{user['user_id']}:{req.stars}",
+        "payload": f"topup:{uid}:{req.stars}",
         "provider_token": "",
         "currency": "XTR",
         "prices": [{"label": f"${usd:.2f}", "amount": req.stars}],
-    }).encode("utf-8")
+    }
 
-    request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        async with http_session.post(url, json=payload) as resp:
+            data = await resp.json()
             if not data.get("ok"):
-                raise HTTPException(status_code=500, detail=data.get("description", "Telegram API error"))
+                logger.error("createInvoiceLink Telegram error: %s", data.get("description"))
+                raise HTTPException(status_code=502, detail="Не удалось создать счёт Telegram Stars")
             return {"invoice_url": data["result"]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка создания счёта: {e}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Никогда не пробрасываем текст исключения наружу — там может оказаться BOT_TOKEN из URL
+        logger.error("createInvoiceLink failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Ошибка соединения с Telegram. Попробуйте позже.")
 
 
 # =========================================================
@@ -458,7 +685,7 @@ SLOT_SYMBOLS = ["🍒", "🍋", "🍇", "🔔", "💎", "7️⃣"]
 
 @app.post("/api/play/slots")
 async def play_slots(req: BetRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     reels = [secrets.choice(SLOT_SYMBOLS) for _ in range(3)]
     mult = 0.0
     if reels[0] == reels[1] == reels[2]:
@@ -466,8 +693,8 @@ async def play_slots(req: BetRequest, user: dict = Depends(get_current_user)):
     elif reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2]:
         mult = 1.55
 
-    win_cents = int(round(bet_cents * mult))
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * mult))
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "slots")
     return {"reels": reels, "multiplier": mult, "win": to_dollars(win_cents), "balance": to_dollars(new_bal_cents)}
 
 
@@ -476,14 +703,19 @@ async def play_slots(req: BetRequest, user: dict = Depends(get_current_user)):
 # =========================================================
 @app.post("/api/play/mines/start")
 async def mines_start(req: MinesStartRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
-    if bet_cents <= 0:
-        raise HTTPException(status_code=400, detail="Некорректная ставка")
+    uid = user["user_id"]
+    check_rate_limit("play", uid, limit=45, window_sec=10.0)
+    bet_cents = validate_bet_cents(req.bet)
 
     async with db.pool.acquire() as conn:
         async with conn.transaction():
+            # Блокируем строку пользователя первой — полностью исключаем race condition
+            u_lock = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1 FOR UPDATE", uid)
+            if not u_lock or int(u_lock["balance_cents"]) < bet_cents:
+                raise HTTPException(status_code=400, detail="Недостаточно средств. Пополните баланс в Кассе!")
+
             existing = await conn.fetchrow(
-                "SELECT active FROM mines_games WHERE user_id = $1 AND active = 1", user["user_id"]
+                "SELECT active FROM mines_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if existing:
                 raise HTTPException(status_code=400, detail="Завершите текущую игру в Мины")
@@ -494,14 +726,14 @@ async def mines_start(req: MinesStartRequest, user: dict = Depends(get_current_u
                 SET balance_cents = balance_cents - $1,
                     games_played = games_played + 1,
                     total_wagered_cents = total_wagered_cents + $1
-                WHERE user_id = $2 AND balance_cents >= $1
+                WHERE user_id = $2
                 RETURNING balance_cents
                 """,
-                bet_cents, user["user_id"],
+                bet_cents,
+                uid,
             )
-            if not row:
-                raise HTTPException(status_code=400, detail="Недостаточно средств. Пополните баланс в Кассе!")
             new_bal_cents = int(row["balance_cents"])
+            await db.log_transaction(conn, uid, "mines_bet", -bet_cents, new_bal_cents, f"mines={req.mines_count}")
 
             cells = list(range(25))
             mines = [cells.pop(secrets.randbelow(len(cells))) for _ in range(req.mines_count)]
@@ -517,17 +749,20 @@ async def mines_start(req: MinesStartRequest, user: dict = Depends(get_current_u
                     revealed = EXCLUDED.revealed,
                     active = 1
                 """,
-                user["user_id"], bet_cents, req.mines_count, json.dumps(mines), json.dumps([]),
+                uid, bet_cents, req.mines_count, json.dumps(mines), json.dumps([]),
             )
     return {"balance": to_dollars(new_bal_cents), "bet": to_dollars(bet_cents), "mines_count": req.mines_count}
 
 
 @app.post("/api/play/mines/reveal")
 async def mines_reveal(req: MinesRevealRequest, user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
+    check_rate_limit("play", uid, limit=60, window_sec=10.0)
+
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             game = await conn.fetchrow(
-                "SELECT * FROM mines_games WHERE user_id = $1 AND active = 1 FOR UPDATE", user["user_id"]
+                "SELECT * FROM mines_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if not game:
                 raise HTTPException(status_code=400, detail="Нет активной игры")
@@ -545,8 +780,8 @@ async def mines_reveal(req: MinesRevealRequest, user: dict = Depends(get_current
                 raise HTTPException(status_code=400, detail="Клетка уже открыта")
 
             if cell in mines:
-                await conn.execute("UPDATE mines_games SET active = 0 WHERE user_id = $1", user["user_id"])
-                u_row = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1", user["user_id"])
+                await conn.execute("UPDATE mines_games SET active = 0 WHERE user_id = $1", uid)
+                u_row = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1", uid)
                 return {
                     "status": "boom",
                     "cell": cell,
@@ -557,14 +792,16 @@ async def mines_reveal(req: MinesRevealRequest, user: dict = Depends(get_current
 
             revealed.append(cell)
             mult = mines_multiplier(game["mines_count"], len(revealed))
-            potential_cents = int(round(game["bet_cents"] * mult))
+            potential_cents = cap_win(int(round(game["bet_cents"] * mult)))
 
-            if len(revealed) == 25 - game["mines_count"]:
+            if len(revealed) == 25 - game["mines_count"] or potential_cents >= MAX_WIN_CENTS:
                 u_row = await conn.fetchrow(
                     "UPDATE users SET balance_cents = balance_cents + $1, total_won_cents = total_won_cents + $1 WHERE user_id = $2 RETURNING balance_cents",
-                    potential_cents, user["user_id"],
+                    potential_cents, uid,
                 )
-                await conn.execute("UPDATE mines_games SET active = 0 WHERE user_id = $1", user["user_id"])
+                new_bal = int(u_row["balance_cents"])
+                await db.log_transaction(conn, uid, "mines_win", potential_cents, new_bal, f"mult={mult}")
+                await conn.execute("UPDATE mines_games SET active = 0 WHERE user_id = $1", uid)
                 return {
                     "status": "win_all",
                     "cell": cell,
@@ -572,10 +809,10 @@ async def mines_reveal(req: MinesRevealRequest, user: dict = Depends(get_current
                     "win": to_dollars(potential_cents),
                     "mines": mines,
                     "revealed": revealed,
-                    "balance": to_dollars(u_row["balance_cents"]),
+                    "balance": to_dollars(new_bal),
                 }
 
-            await conn.execute("UPDATE mines_games SET revealed = $1 WHERE user_id = $2", json.dumps(revealed), user["user_id"])
+            await conn.execute("UPDATE mines_games SET revealed = $1 WHERE user_id = $2", json.dumps(revealed), uid)
             return {
                 "status": "safe",
                 "cell": cell,
@@ -587,10 +824,11 @@ async def mines_reveal(req: MinesRevealRequest, user: dict = Depends(get_current
 
 @app.post("/api/play/mines/cashout")
 async def mines_cashout(user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             game = await conn.fetchrow(
-                "SELECT * FROM mines_games WHERE user_id = $1 AND active = 1 FOR UPDATE", user["user_id"]
+                "SELECT * FROM mines_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if not game:
                 raise HTTPException(status_code=400, detail="Нет активной игры")
@@ -601,14 +839,15 @@ async def mines_cashout(user: dict = Depends(get_current_user)):
 
             mines = json.loads(game["mines_positions"])
             mult = mines_multiplier(game["mines_count"], len(revealed))
-            win_cents = int(round(game["bet_cents"] * mult))
+            win_cents = cap_win(int(round(game["bet_cents"] * mult)))
 
             u_row = await conn.fetchrow(
                 "UPDATE users SET balance_cents = balance_cents + $1, total_won_cents = total_won_cents + $1 WHERE user_id = $2 RETURNING balance_cents",
-                win_cents, user["user_id"],
+                win_cents, uid,
             )
-            await conn.execute("UPDATE mines_games SET active = 0 WHERE user_id = $1", user["user_id"])
             new_bal_cents = int(u_row["balance_cents"])
+            await db.log_transaction(conn, uid, "mines_win", win_cents, new_bal_cents, f"mult={mult}")
+            await conn.execute("UPDATE mines_games SET active = 0 WHERE user_id = $1", uid)
 
     return {
         "win": to_dollars(win_cents),
@@ -620,11 +859,11 @@ async def mines_cashout(user: dict = Depends(get_current_user)):
 
 
 # =========================================================
-# 3. КОСТИ (нерф до 93% RTP, шанс 5–90%)
+# 3. КОСТИ (93% RTP, шанс 5–90%)
 # =========================================================
 @app.post("/api/play/dice")
 async def play_dice(req: DiceRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     chance = (req.target - 1) if req.direction == "under" else (100 - req.target)
     if chance < 5 or chance > 90:
         raise HTTPException(status_code=400, detail="Допустимый шанс победы — от 5% до 90%")
@@ -632,9 +871,9 @@ async def play_dice(req: DiceRequest, user: dict = Depends(get_current_user)):
     roll = secrets.randbelow(100) + 1
     is_win = (roll < req.target) if req.direction == "under" else (roll > req.target)
     multiplier = round(93.0 / chance, 2)
-    win_cents = int(round(bet_cents * multiplier)) if is_win else 0
+    raw_win = int(round(bet_cents * multiplier)) if is_win else 0
 
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "dice")
     return {
         "roll": roll,
         "is_win": is_win,
@@ -649,10 +888,10 @@ async def play_dice(req: DiceRequest, user: dict = Depends(get_current_user)):
 # =========================================================
 @app.post("/api/play/coinflip")
 async def play_coinflip(req: CoinflipRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     result = secrets.choice(["heads", "tails"])
-    win_cents = int(round(bet_cents * 1.90)) if result == req.choice else 0
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * 1.90)) if result == req.choice else 0
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "coinflip")
     return {"result": result, "win": to_dollars(win_cents), "balance": to_dollars(new_bal_cents)}
 
 
@@ -661,19 +900,24 @@ async def play_coinflip(req: CoinflipRequest, user: dict = Depends(get_current_u
 # =========================================================
 @app.post("/api/play/crash/start")
 async def crash_start(req: CrashStartRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    uid = user["user_id"]
+    check_rate_limit("play", uid, limit=45, window_sec=10.0)
+    bet_cents = validate_bet_cents(req.bet)
     if req.auto_cashout != 0.0 and req.auto_cashout < 1.05:
         raise HTTPException(status_code=400, detail="Авто-вывод должен быть от 1.05x (или 0 для отключения)")
 
     async with db.pool.acquire() as conn:
         async with conn.transaction():
+            # Блокируем пользователя первым
+            await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1 FOR UPDATE", uid)
+
             existing = await conn.fetchrow(
-                "SELECT * FROM crash_games WHERE user_id = $1 AND active = 1 FOR UPDATE", user["user_id"]
+                "SELECT * FROM crash_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if existing:
-                if crash_current_mult(existing["started_at"]) < existing["crash_point"]:
+                settled = await settle_crash_if_ended(conn, existing)
+                if not settled:
                     raise HTTPException(status_code=400, detail="Ракета уже в полёте!")
-                await conn.execute("UPDATE crash_games SET active = 0 WHERE user_id = $1", user["user_id"])
 
             row = await conn.fetchrow(
                 """
@@ -684,11 +928,13 @@ async def crash_start(req: CrashStartRequest, user: dict = Depends(get_current_u
                 WHERE user_id = $2 AND balance_cents >= $1
                 RETURNING balance_cents
                 """,
-                bet_cents, user["user_id"],
+                bet_cents,
+                uid,
             )
             if not row:
                 raise HTTPException(status_code=400, detail="Недостаточно средств")
             new_bal_cents = int(row["balance_cents"])
+            await db.log_transaction(conn, uid, "crash_bet", -bet_cents, new_bal_cents, f"auto={req.auto_cashout}")
 
             cp = draw_crash_point()
             now = time.time()
@@ -705,7 +951,7 @@ async def crash_start(req: CrashStartRequest, user: dict = Depends(get_current_u
                         started_at = EXCLUDED.started_at,
                         active = 0
                     """,
-                    user["user_id"], bet_cents, req.auto_cashout, now,
+                    uid, bet_cents, req.auto_cashout, now,
                 )
                 return {
                     "status": "crashed",
@@ -726,7 +972,7 @@ async def crash_start(req: CrashStartRequest, user: dict = Depends(get_current_u
                     started_at = EXCLUDED.started_at,
                     active = 1
                 """,
-                user["user_id"], bet_cents, cp, req.auto_cashout, now,
+                uid, bet_cents, cp, req.auto_cashout, now,
             )
 
     return {
@@ -740,90 +986,57 @@ async def crash_start(req: CrashStartRequest, user: dict = Depends(get_current_u
 
 @app.get("/api/play/crash/state")
 async def crash_state(user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             game = await conn.fetchrow(
-                "SELECT * FROM crash_games WHERE user_id = $1 AND active = 1 FOR UPDATE", user["user_id"]
+                "SELECT * FROM crash_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if not game:
                 return {"status": "idle"}
 
-            now_mult = crash_current_mult(game["started_at"])
-            auto_c = float(game["auto_cashout"] or 0.0)
-            cp = float(game["crash_point"])
+            settled = await settle_crash_if_ended(conn, game)
+            if settled:
+                return settled
 
-            if auto_c >= 1.05 and now_mult >= auto_c and auto_c <= cp:
-                win_cents = int(round(game["bet_cents"] * auto_c))
-                u_row = await conn.fetchrow(
-                    "UPDATE users SET balance_cents = balance_cents + $1, total_won_cents = total_won_cents + $1 WHERE user_id = $2 RETURNING balance_cents",
-                    win_cents, user["user_id"],
-                )
-                await conn.execute("UPDATE crash_games SET active = 0 WHERE user_id = $1", user["user_id"])
-                return {
-                    "status": "cashed_out",
-                    "multiplier": auto_c,
-                    "crash_point": cp,
-                    "win": to_dollars(win_cents),
-                    "balance": to_dollars(u_row["balance_cents"]),
-                }
-
-            if now_mult >= cp:
-                await conn.execute("UPDATE crash_games SET active = 0 WHERE user_id = $1", user["user_id"])
-                u_row = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1", user["user_id"])
-                return {
-                    "status": "crashed",
-                    "multiplier": cp,
-                    "crash_point": cp,
-                    "win": 0.0,
-                    "balance": to_dollars(u_row["balance_cents"]),
-                }
-
-            return {"status": "flying", "multiplier": now_mult}
+            return {"status": "flying", "multiplier": crash_current_mult(game["started_at"])}
 
 
 @app.post("/api/play/crash/cashout")
 async def crash_cashout(user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             game = await conn.fetchrow(
-                "SELECT * FROM crash_games WHERE user_id = $1 AND active = 1 FOR UPDATE", user["user_id"]
+                "SELECT * FROM crash_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if not game:
                 raise HTTPException(status_code=400, detail="Нет активного полёта")
 
+            settled = await settle_crash_if_ended(conn, game)
+            if settled:
+                return settled
+
             now_mult = crash_current_mult(game["started_at"])
-            auto_c = float(game["auto_cashout"] or 0.0)
             cp = float(game["crash_point"])
+            if now_mult < 1.01:
+                raise HTTPException(status_code=400, detail="Подождите долю секунды (минимум 1.01x)")
 
-            if auto_c >= 1.05 and now_mult >= auto_c and auto_c <= cp:
-                cash_mult = auto_c
-            elif now_mult >= cp:
-                await conn.execute("UPDATE crash_games SET active = 0 WHERE user_id = $1", user["user_id"])
-                u_row = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1", user["user_id"])
-                return {
-                    "status": "crashed",
-                    "multiplier": cp,
-                    "crash_point": cp,
-                    "win": 0.0,
-                    "balance": to_dollars(u_row["balance_cents"]),
-                }
-            else:
-                cash_mult = max(1.01, now_mult)
-                if cash_mult > cp:
-                    cash_mult = cp
-
-            win_cents = int(round(game["bet_cents"] * cash_mult))
+            cash_mult = min(now_mult, cp)
+            win_cents = cap_win(int(round(game["bet_cents"] * cash_mult)))
             u_row = await conn.fetchrow(
                 "UPDATE users SET balance_cents = balance_cents + $1, total_won_cents = total_won_cents + $1 WHERE user_id = $2 RETURNING balance_cents",
-                win_cents, user["user_id"],
+                win_cents, uid,
             )
-            await conn.execute("UPDATE crash_games SET active = 0 WHERE user_id = $1", user["user_id"])
+            new_bal = int(u_row["balance_cents"])
+            await db.log_transaction(conn, uid, "crash_win", win_cents, new_bal, f"mult={cash_mult}")
+            await conn.execute("UPDATE crash_games SET active = 0 WHERE user_id = $1", uid)
             return {
                 "status": "cashed_out",
                 "multiplier": cash_mult,
                 "crash_point": cp,
                 "win": to_dollars(win_cents),
-                "balance": to_dollars(u_row["balance_cents"]),
+                "balance": to_dollars(new_bal),
             }
 
 
@@ -835,7 +1048,7 @@ RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36
 
 @app.post("/api/play/roulette")
 async def play_roulette(req: RouletteRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     if req.bet_type == "number" and req.number is None:
         raise HTTPException(status_code=400, detail="Укажите число от 0 до 36")
 
@@ -867,8 +1080,8 @@ async def play_roulette(req: RouletteRequest, user: dict = Depends(get_current_u
     elif req.bet_type == "dozen3":
         is_win, mult = (25 <= number <= 36), 2.85
 
-    win_cents = int(round(bet_cents * mult)) if is_win else 0
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * mult)) if is_win else 0
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "roulette")
     return {
         "number": number,
         "color": color,
@@ -887,11 +1100,11 @@ WHEEL_SECTORS = [0.0, 1.5, 0.0, 2.0, 0.5, 0.0, 1.2, 0.0, 2.5, 0.0, 0.5, 3.0]
 
 @app.post("/api/play/wheel")
 async def play_wheel(req: BetRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     sector_index = secrets.randbelow(len(WHEEL_SECTORS))
     mult = WHEEL_SECTORS[sector_index]
-    win_cents = int(round(bet_cents * mult))
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * mult))
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "wheel")
     return {
         "sector_index": sector_index,
         "multiplier": mult,
@@ -901,21 +1114,61 @@ async def play_wheel(req: BetRequest, user: dict = Depends(get_current_user)):
 
 
 # =========================================================
-# 8. КАРТЫ HI-LO (нерф до ~90% RTP)
+# 8. КАРТЫ HI-LO (серверная карта в БД, RTP ~90%)
 # =========================================================
 @app.post("/api/play/hilo")
 async def play_hilo(req: HiloRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
-    count = (14 - req.current_card) if req.guess == "high" else (req.current_card - 2)
-    if count <= 0:
-        raise HTTPException(status_code=400, detail="Невозможный выбор для этой карты")
+    uid = user["user_id"]
+    check_rate_limit("play", uid, limit=45, window_sec=10.0)
+    bet_cents = validate_bet_cents(req.bet)
 
-    mult = max(1.03, round(11.7 / count, 2))
-    next_card = secrets.randbelow(13) + 2
-    is_win = (next_card > req.current_card) if req.guess == "high" else (next_card < req.current_card)
-    win_cents = int(round(bet_cents * mult)) if is_win else 0
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    async with db.pool.acquire() as conn:
+        async with conn.transaction():
+            u_row = await conn.fetchrow(
+                "SELECT balance_cents, hilo_card FROM users WHERE user_id = $1 FOR UPDATE",
+                uid,
+            )
+            if not u_row or int(u_row["balance_cents"]) < bet_cents:
+                raise HTTPException(status_code=400, detail="Недостаточно средств. Пополните баланс в Кассе!")
+
+            current_card = int(u_row["hilo_card"] or 7)
+            if current_card < 2 or current_card > 14:
+                current_card = 7
+
+            count = (14 - current_card) if req.guess == "high" else (current_card - 2)
+            if count <= 0:
+                raise HTTPException(status_code=400, detail="Невозможный выбор для этой карты")
+
+            mult = max(1.03, round(11.7 / count, 2))
+            next_card = secrets.randbelow(13) + 2
+            is_win = (next_card > current_card) if req.guess == "high" else (next_card < current_card)
+            win_cents = cap_win(int(round(bet_cents * mult))) if is_win else 0
+
+            updated = await conn.fetchrow(
+                """
+                UPDATE users
+                SET balance_cents = balance_cents - $1 + $2,
+                    games_played = games_played + 1,
+                    total_wagered_cents = total_wagered_cents + $1,
+                    total_won_cents = total_won_cents + $2,
+                    hilo_card = $3
+                WHERE user_id = $4
+                RETURNING balance_cents
+                """,
+                bet_cents, win_cents, next_card, uid,
+            )
+            new_bal_cents = int(updated["balance_cents"])
+            await db.log_transaction(
+                conn,
+                uid,
+                "play_hilo",
+                win_cents - bet_cents,
+                new_bal_cents,
+                f"cur={current_card}:next={next_card}:bet={bet_cents}:win={win_cents}",
+            )
+
     return {
+        "previous_card": current_card,
         "next_card": next_card,
         "is_win": is_win,
         "win": to_dollars(win_cents),
@@ -936,12 +1189,12 @@ PLINKO_BUCKETS = {
 
 @app.post("/api/play/plinko")
 async def play_plinko(req: PlinkoRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     path = [secrets.randbelow(2) for _ in range(8)]  # 0 = лево, 1 = право
     bucket = sum(path)
     mult = PLINKO_BUCKETS[req.risk][bucket]
-    win_cents = int(round(bet_cents * mult))
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * mult))
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "plinko")
     return {
         "path": path,
         "bucket": bucket,
@@ -956,13 +1209,19 @@ async def play_plinko(req: PlinkoRequest, user: dict = Depends(get_current_user)
 # =========================================================
 @app.post("/api/play/tower/start")
 async def tower_start(req: TowerStartRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    uid = user["user_id"]
+    check_rate_limit("play", uid, limit=45, window_sec=10.0)
+    bet_cents = validate_bet_cents(req.bet)
     cols, traps_per_floor = TOWER_CFG[req.difficulty]
 
     async with db.pool.acquire() as conn:
         async with conn.transaction():
+            u_lock = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1 FOR UPDATE", uid)
+            if not u_lock or int(u_lock["balance_cents"]) < bet_cents:
+                raise HTTPException(status_code=400, detail="Недостаточно средств")
+
             existing = await conn.fetchrow(
-                "SELECT active FROM tower_games WHERE user_id = $1 AND active = 1", user["user_id"]
+                "SELECT active FROM tower_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if existing:
                 raise HTTPException(status_code=400, detail="Завершите текущую игру в Башне")
@@ -973,14 +1232,14 @@ async def tower_start(req: TowerStartRequest, user: dict = Depends(get_current_u
                 SET balance_cents = balance_cents - $1,
                     games_played = games_played + 1,
                     total_wagered_cents = total_wagered_cents + $1
-                WHERE user_id = $2 AND balance_cents >= $1
+                WHERE user_id = $2
                 RETURNING balance_cents
                 """,
-                bet_cents, user["user_id"],
+                bet_cents,
+                uid,
             )
-            if not row:
-                raise HTTPException(status_code=400, detail="Недостаточно средств")
             new_bal_cents = int(row["balance_cents"])
+            await db.log_transaction(conn, uid, "tower_bet", -bet_cents, new_bal_cents, f"diff={req.difficulty}")
 
             traps = []
             for _ in range(TOWER_FLOORS):
@@ -999,7 +1258,7 @@ async def tower_start(req: TowerStartRequest, user: dict = Depends(get_current_u
                     floor = 0,
                     active = 1
                 """,
-                user["user_id"], bet_cents, req.difficulty, json.dumps(traps),
+                uid, bet_cents, req.difficulty, json.dumps(traps),
             )
     return {
         "balance": to_dollars(new_bal_cents),
@@ -1011,10 +1270,13 @@ async def tower_start(req: TowerStartRequest, user: dict = Depends(get_current_u
 
 @app.post("/api/play/tower/climb")
 async def tower_climb(req: TowerClimbRequest, user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
+    check_rate_limit("play", uid, limit=60, window_sec=10.0)
+
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             game = await conn.fetchrow(
-                "SELECT * FROM tower_games WHERE user_id = $1 AND active = 1 FOR UPDATE", user["user_id"]
+                "SELECT * FROM tower_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if not game:
                 raise HTTPException(status_code=400, detail="Нет активной игры в Башне")
@@ -1028,8 +1290,8 @@ async def tower_climb(req: TowerClimbRequest, user: dict = Depends(get_current_u
             floor = int(game["floor"])
 
             if col in traps[floor]:
-                await conn.execute("UPDATE tower_games SET active = 0 WHERE user_id = $1", user["user_id"])
-                u_row = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1", user["user_id"])
+                await conn.execute("UPDATE tower_games SET active = 0 WHERE user_id = $1", uid)
+                u_row = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1", uid)
                 return {
                     "status": "boom",
                     "floor": floor,
@@ -1040,14 +1302,16 @@ async def tower_climb(req: TowerClimbRequest, user: dict = Depends(get_current_u
 
             next_floor = floor + 1
             mult = tower_multiplier(game["difficulty"], next_floor)
-            pot_cents = int(round(game["bet_cents"] * mult))
+            pot_cents = cap_win(int(round(game["bet_cents"] * mult)))
 
-            if next_floor >= TOWER_FLOORS:
+            if next_floor >= TOWER_FLOORS or pot_cents >= MAX_WIN_CENTS:
                 u_row = await conn.fetchrow(
                     "UPDATE users SET balance_cents = balance_cents + $1, total_won_cents = total_won_cents + $1 WHERE user_id = $2 RETURNING balance_cents",
-                    pot_cents, user["user_id"],
+                    pot_cents, uid,
                 )
-                await conn.execute("UPDATE tower_games SET active = 0, floor = $1 WHERE user_id = $2", next_floor, user["user_id"])
+                new_bal = int(u_row["balance_cents"])
+                await db.log_transaction(conn, uid, "tower_win", pot_cents, new_bal, f"floor={next_floor}:mult={mult}")
+                await conn.execute("UPDATE tower_games SET active = 0, floor = $1 WHERE user_id = $2", next_floor, uid)
                 return {
                     "status": "win_all",
                     "floor": next_floor,
@@ -1055,10 +1319,10 @@ async def tower_climb(req: TowerClimbRequest, user: dict = Depends(get_current_u
                     "multiplier": mult,
                     "win": to_dollars(pot_cents),
                     "traps": traps,
-                    "balance": to_dollars(u_row["balance_cents"]),
+                    "balance": to_dollars(new_bal),
                 }
 
-            await conn.execute("UPDATE tower_games SET floor = $1 WHERE user_id = $2", next_floor, user["user_id"])
+            await conn.execute("UPDATE tower_games SET floor = $1 WHERE user_id = $2", next_floor, uid)
             return {
                 "status": "safe",
                 "floor": next_floor,
@@ -1070,10 +1334,11 @@ async def tower_climb(req: TowerClimbRequest, user: dict = Depends(get_current_u
 
 @app.post("/api/play/tower/cashout")
 async def tower_cashout(user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             game = await conn.fetchrow(
-                "SELECT * FROM tower_games WHERE user_id = $1 AND active = 1 FOR UPDATE", user["user_id"]
+                "SELECT * FROM tower_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if not game:
                 raise HTTPException(status_code=400, detail="Нет активной игры")
@@ -1083,17 +1348,19 @@ async def tower_cashout(user: dict = Depends(get_current_user)):
 
             traps = json.loads(game["traps"])
             mult = tower_multiplier(game["difficulty"], floor)
-            win_cents = int(round(game["bet_cents"] * mult))
+            win_cents = cap_win(int(round(game["bet_cents"] * mult)))
             u_row = await conn.fetchrow(
                 "UPDATE users SET balance_cents = balance_cents + $1, total_won_cents = total_won_cents + $1 WHERE user_id = $2 RETURNING balance_cents",
-                win_cents, user["user_id"],
+                win_cents, uid,
             )
-            await conn.execute("UPDATE tower_games SET active = 0 WHERE user_id = $1", user["user_id"])
+            new_bal = int(u_row["balance_cents"])
+            await db.log_transaction(conn, uid, "tower_win", win_cents, new_bal, f"floor={floor}:mult={mult}")
+            await conn.execute("UPDATE tower_games SET active = 0 WHERE user_id = $1", uid)
             return {
                 "win": to_dollars(win_cents),
                 "multiplier": mult,
                 "traps": traps,
-                "balance": to_dollars(u_row["balance_cents"]),
+                "balance": to_dollars(new_bal),
             }
 
 
@@ -1102,11 +1369,11 @@ async def tower_cashout(user: dict = Depends(get_current_user)):
 # =========================================================
 @app.post("/api/play/limbo")
 async def play_limbo(req: LimboRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     result = draw_crash_point()
     is_win = result >= req.target
-    win_cents = int(round(bet_cents * req.target)) if is_win else 0
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * req.target)) if is_win else 0
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "limbo")
     return {
         "result": result,
         "is_win": is_win,
@@ -1116,23 +1383,23 @@ async def play_limbo(req: LimboRequest, user: dict = Depends(get_current_user)):
 
 
 # =========================================================
-# 12. КЕНО (5x5, выбор 1–8 чисел, RTP ~92%)
+# 12. КЕНО (5x5, выбор 1–8 чисел, исправленный RTP 91.2%–93.5%)
 # =========================================================
 KENO_PAYOUTS = {
     1: {1: 2.85},
-    2: {1: 0.5, 2: 7.5},
-    3: {2: 2.5, 3: 16.0},
+    2: {1: 0.5, 2: 7.4},
+    3: {2: 2.5, 3: 16.5},
     4: {2: 1.5, 3: 4.5, 4: 25.0},
-    5: {2: 0.7, 3: 2.8, 4: 12.0, 5: 50.0},
-    6: {2: 0.3, 3: 2.0, 4: 6.5, 5: 25.0, 6: 100.0},
-    7: {3: 1.4, 4: 4.0, 5: 15.0, 6: 60.0, 7: 200.0},
-    8: {3: 1.0, 4: 2.8, 5: 8.5, 6: 30.0, 7: 100.0, 8: 300.0},
+    5: {2: 0.65, 3: 2.6, 4: 11.5, 5: 48.0},
+    6: {2: 0.25, 3: 1.75, 4: 5.8, 5: 23.0, 6: 90.0},
+    7: {3: 1.2, 4: 3.4, 5: 12.5, 6: 50.0, 7: 160.0},
+    8: {3: 0.85, 4: 2.2, 5: 6.5, 6: 24.0, 7: 80.0, 8: 250.0},
 }
 
 
 @app.post("/api/play/keno")
 async def play_keno(req: KenoRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     picks = sorted(set(req.picks))
     if len(picks) != len(req.picks) or any(p < 1 or p > 25 for p in picks):
         raise HTTPException(status_code=400, detail="Выберите от 1 до 8 уникальных чисел (1–25)")
@@ -1141,8 +1408,8 @@ async def play_keno(req: KenoRequest, user: dict = Depends(get_current_user)):
     drawn = sorted([pool_nums.pop(secrets.randbelow(len(pool_nums))) for _ in range(8)])
     hits = sorted(set(picks) & set(drawn))
     mult = KENO_PAYOUTS[len(picks)].get(len(hits), 0.0)
-    win_cents = int(round(bet_cents * mult))
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * mult))
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "keno")
     return {
         "drawn": drawn,
         "hits": hits,
@@ -1153,7 +1420,7 @@ async def play_keno(req: KenoRequest, user: dict = Depends(get_current_user)):
 
 
 # =========================================================
-# 13. КЕЙСЫ (RTP ~90.8%)
+# 13. КЕЙСЫ (RTP ~90.8%, с проверкой MAX_BET_USD)
 # =========================================================
 CASE_PRICES = {"bronze": 100, "silver": 500, "gold": 2000, "royal": 5000}
 CASE_ITEMS = [
@@ -1169,7 +1436,7 @@ CASE_ITEMS = [
 
 @app.post("/api/play/cases")
 async def play_cases(req: CasesRequest, user: dict = Depends(get_current_user)):
-    bet_cents = CASE_PRICES[req.tier]
+    bet_cents = validate_bet_cents(to_dollars(CASE_PRICES[req.tier]))
     roll = secrets.randbelow(1000)
     acc = 0
     picked = CASE_ITEMS[0]
@@ -1179,8 +1446,8 @@ async def play_cases(req: CasesRequest, user: dict = Depends(get_current_user)):
             picked = item
             break
 
-    win_cents = int(round(bet_cents * picked["mult"]))
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * picked["mult"]))
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "cases")
     return {
         "tier": req.tier,
         "cost": to_dollars(bet_cents),
@@ -1209,7 +1476,7 @@ def bj_score(hand: list[str]) -> int:
     total = 0
     aces = 0
     for c in hand:
-        rank = c[:-2] if len(c) > 2 else c[0]
+        rank = parse_card_rank(c)
         if rank in ("J", "Q", "K", "10"):
             total += 10
         elif rank == "A":
@@ -1225,14 +1492,18 @@ def bj_score(hand: list[str]) -> int:
 
 @app.post("/api/play/blackjack/start")
 async def blackjack_start(req: BetRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
-    if bet_cents <= 0:
-        raise HTTPException(status_code=400, detail="Некорректная ставка")
+    uid = user["user_id"]
+    check_rate_limit("play", uid, limit=45, window_sec=10.0)
+    bet_cents = validate_bet_cents(req.bet)
 
     async with db.pool.acquire() as conn:
         async with conn.transaction():
+            u_lock = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1 FOR UPDATE", uid)
+            if not u_lock or int(u_lock["balance_cents"]) < bet_cents:
+                raise HTTPException(status_code=400, detail="Недостаточно средств")
+
             existing = await conn.fetchrow(
-                "SELECT active FROM blackjack_games WHERE user_id = $1 AND active = 1", user["user_id"]
+                "SELECT active FROM blackjack_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if existing:
                 raise HTTPException(status_code=400, detail="Завершите текущую раздачу Блэкджека")
@@ -1243,14 +1514,14 @@ async def blackjack_start(req: BetRequest, user: dict = Depends(get_current_user
                 SET balance_cents = balance_cents - $1,
                     games_played = games_played + 1,
                     total_wagered_cents = total_wagered_cents + $1
-                WHERE user_id = $2 AND balance_cents >= $1
+                WHERE user_id = $2
                 RETURNING balance_cents
                 """,
-                bet_cents, user["user_id"],
+                bet_cents,
+                uid,
             )
-            if not row:
-                raise HTTPException(status_code=400, detail="Недостаточно средств")
             bal_cents = int(row["balance_cents"])
+            await db.log_transaction(conn, uid, "bj_bet", -bet_cents, bal_cents)
 
             deck = make_bj_deck()
             p_hand = [deck.pop(), deck.pop()]
@@ -1263,12 +1534,14 @@ async def blackjack_start(req: BetRequest, user: dict = Depends(get_current_user
                     win_cents = bet_cents
                     outcome = "push"
                 else:
-                    win_cents = int(round(bet_cents * 2.4))
+                    win_cents = cap_win(int(round(bet_cents * 2.4)))
                     outcome = "blackjack"
                 u_row = await conn.fetchrow(
                     "UPDATE users SET balance_cents = balance_cents + $1, total_won_cents = total_won_cents + $1 WHERE user_id = $2 RETURNING balance_cents",
-                    win_cents, user["user_id"],
+                    win_cents, uid,
                 )
+                new_bal = int(u_row["balance_cents"])
+                await db.log_transaction(conn, uid, f"bj_{outcome}", win_cents, new_bal)
                 return {
                     "status": "finished",
                     "outcome": outcome,
@@ -1277,7 +1550,7 @@ async def blackjack_start(req: BetRequest, user: dict = Depends(get_current_user
                     "dealer_hand": d_hand,
                     "dealer_score": d_sc,
                     "win": to_dollars(win_cents),
-                    "balance": to_dollars(u_row["balance_cents"]),
+                    "balance": to_dollars(new_bal),
                 }
 
             await conn.execute(
@@ -1291,7 +1564,7 @@ async def blackjack_start(req: BetRequest, user: dict = Depends(get_current_user
                     dealer_hand = EXCLUDED.dealer_hand,
                     active = 1
                 """,
-                user["user_id"], bet_cents, json.dumps(deck), json.dumps(p_hand), json.dumps(d_hand),
+                uid, bet_cents, json.dumps(deck), json.dumps(p_hand), json.dumps(d_hand),
             )
     return {
         "status": "playing",
@@ -1305,10 +1578,13 @@ async def blackjack_start(req: BetRequest, user: dict = Depends(get_current_user
 
 @app.post("/api/play/blackjack/hit")
 async def blackjack_hit(user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
+    check_rate_limit("play", uid, limit=60, window_sec=10.0)
+
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             game = await conn.fetchrow(
-                "SELECT * FROM blackjack_games WHERE user_id = $1 AND active = 1 FOR UPDATE", user["user_id"]
+                "SELECT * FROM blackjack_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if not game:
                 raise HTTPException(status_code=400, detail="Нет активной игры в Блэкджек")
@@ -1320,8 +1596,8 @@ async def blackjack_hit(user: dict = Depends(get_current_user)):
             p_sc = bj_score(p_hand)
 
             if p_sc > 21:
-                await conn.execute("UPDATE blackjack_games SET active = 0 WHERE user_id = $1", user["user_id"])
-                u_row = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1", user["user_id"])
+                await conn.execute("UPDATE blackjack_games SET active = 0 WHERE user_id = $1", uid)
+                u_row = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1", uid)
                 return {
                     "status": "finished",
                     "outcome": "bust",
@@ -1337,8 +1613,11 @@ async def blackjack_hit(user: dict = Depends(get_current_user)):
                 while bj_score(d_hand) < 17:
                     d_hand.append(deck.pop())
                 d_sc = bj_score(d_hand)
-                if d_sc > 21 or p_sc > d_sc:
-                    win_cents, outcome = int(round(game["bet_cents"] * 1.95)), "win"
+                dealer_natural = (len(d_hand) == 2 and d_sc == 21)
+                if dealer_natural:
+                    win_cents, outcome = 0, "lose"
+                elif d_sc > 21 or p_sc > d_sc:
+                    win_cents, outcome = cap_win(int(round(game["bet_cents"] * 1.95))), "win"
                 elif p_sc == d_sc:
                     win_cents, outcome = int(game["bet_cents"]), "push"
                 else:
@@ -1346,9 +1625,12 @@ async def blackjack_hit(user: dict = Depends(get_current_user)):
 
                 u_row = await conn.fetchrow(
                     "UPDATE users SET balance_cents = balance_cents + $1, total_won_cents = total_won_cents + $1 WHERE user_id = $2 RETURNING balance_cents",
-                    win_cents, user["user_id"],
+                    win_cents, uid,
                 )
-                await conn.execute("UPDATE blackjack_games SET active = 0 WHERE user_id = $1", user["user_id"])
+                new_bal = int(u_row["balance_cents"])
+                if win_cents > 0:
+                    await db.log_transaction(conn, uid, f"bj_{outcome}", win_cents, new_bal)
+                await conn.execute("UPDATE blackjack_games SET active = 0 WHERE user_id = $1", uid)
                 return {
                     "status": "finished",
                     "outcome": outcome,
@@ -1357,12 +1639,12 @@ async def blackjack_hit(user: dict = Depends(get_current_user)):
                     "dealer_hand": d_hand,
                     "dealer_score": d_sc,
                     "win": to_dollars(win_cents),
-                    "balance": to_dollars(u_row["balance_cents"]),
+                    "balance": to_dollars(new_bal),
                 }
 
             await conn.execute(
                 "UPDATE blackjack_games SET deck = $1, player_hand = $2 WHERE user_id = $3",
-                json.dumps(deck), json.dumps(p_hand), user["user_id"],
+                json.dumps(deck), json.dumps(p_hand), uid,
             )
             return {
                 "status": "playing",
@@ -1375,10 +1657,11 @@ async def blackjack_hit(user: dict = Depends(get_current_user)):
 
 @app.post("/api/play/blackjack/stand")
 async def blackjack_stand(user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             game = await conn.fetchrow(
-                "SELECT * FROM blackjack_games WHERE user_id = $1 AND active = 1 FOR UPDATE", user["user_id"]
+                "SELECT * FROM blackjack_games WHERE user_id = $1 AND active = 1 FOR UPDATE", uid
             )
             if not game:
                 raise HTTPException(status_code=400, detail="Нет активной игры в Блэкджек")
@@ -1391,8 +1674,11 @@ async def blackjack_stand(user: dict = Depends(get_current_user)):
 
             p_sc = bj_score(p_hand)
             d_sc = bj_score(d_hand)
-            if d_sc > 21 or p_sc > d_sc:
-                win_cents, outcome = int(round(game["bet_cents"] * 1.95)), "win"
+            dealer_natural = (len(d_hand) == 2 and d_sc == 21)
+            if dealer_natural and not (len(p_hand) == 2 and p_sc == 21):
+                win_cents, outcome = 0, "lose"
+            elif d_sc > 21 or p_sc > d_sc:
+                win_cents, outcome = cap_win(int(round(game["bet_cents"] * 1.95))), "win"
             elif p_sc == d_sc:
                 win_cents, outcome = int(game["bet_cents"]), "push"
             else:
@@ -1400,9 +1686,12 @@ async def blackjack_stand(user: dict = Depends(get_current_user)):
 
             u_row = await conn.fetchrow(
                 "UPDATE users SET balance_cents = balance_cents + $1, total_won_cents = total_won_cents + $1 WHERE user_id = $2 RETURNING balance_cents",
-                win_cents, user["user_id"],
+                win_cents, uid,
             )
-            await conn.execute("UPDATE blackjack_games SET active = 0 WHERE user_id = $1", user["user_id"])
+            new_bal = int(u_row["balance_cents"])
+            if win_cents > 0:
+                await db.log_transaction(conn, uid, f"bj_{outcome}", win_cents, new_bal)
+            await conn.execute("UPDATE blackjack_games SET active = 0 WHERE user_id = $1", uid)
             return {
                 "status": "finished",
                 "outcome": outcome,
@@ -1411,7 +1700,7 @@ async def blackjack_stand(user: dict = Depends(get_current_user)):
                 "dealer_hand": d_hand,
                 "dealer_score": d_sc,
                 "win": to_dollars(win_cents),
-                "balance": to_dollars(u_row["balance_cents"]),
+                "balance": to_dollars(new_bal),
             }
 
 
@@ -1419,7 +1708,7 @@ async def blackjack_stand(user: dict = Depends(get_current_user)):
 # 15. БАККАРА
 # =========================================================
 def bac_val(card: str) -> int:
-    rank = card[:-2] if len(card) > 2 else card[0]
+    rank = parse_card_rank(card)
     if rank in ("10", "J", "Q", "K"):
         return 0
     return 1 if rank == "A" else int(rank)
@@ -1427,7 +1716,7 @@ def bac_val(card: str) -> int:
 
 @app.post("/api/play/baccarat")
 async def play_baccarat(req: BaccaratRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     deck = make_bj_deck()
     p_cards = [deck.pop(), deck.pop()]
     b_cards = [deck.pop(), deck.pop()]
@@ -1458,8 +1747,8 @@ async def play_baccarat(req: BaccaratRequest, user: dict = Depends(get_current_u
 
     winner = "player" if p_sc > b_sc else ("banker" if b_sc > p_sc else "tie")
     mults = {"player": 1.95, "banker": 1.90, "tie": 8.0}
-    win_cents = int(round(bet_cents * mults[winner])) if req.choice == winner else 0
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * mults[winner])) if req.choice == winner else 0
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "baccarat")
     return {
         "player_cards": p_cards,
         "banker_cards": b_cards,
@@ -1476,13 +1765,13 @@ async def play_baccarat(req: BaccaratRequest, user: dict = Depends(get_current_u
 # =========================================================
 @app.post("/api/play/thimbles")
 async def play_thimbles(req: ThimblesRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     cups = [0, 1, 2]
     ball_positions = [cups.pop(secrets.randbelow(len(cups))) for _ in range(req.balls)]
     is_win = req.cup in ball_positions
     mult = 2.80 if req.balls == 1 else 1.40
-    win_cents = int(round(bet_cents * mult)) if is_win else 0
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * mult)) if is_win else 0
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "thimbles")
     return {
         "ball_positions": ball_positions,
         "is_win": is_win,
@@ -1497,7 +1786,7 @@ async def play_thimbles(req: ThimblesRequest, user: dict = Depends(get_current_u
 # =========================================================
 @app.post("/api/play/rps")
 async def play_rps(req: RpsRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     bot_choice = secrets.choice(["rock", "paper", "scissors"])
     wins = {("rock", "scissors"), ("scissors", "paper"), ("paper", "rock")}
     if req.choice == bot_choice:
@@ -1507,8 +1796,8 @@ async def play_rps(req: RpsRequest, user: dict = Depends(get_current_user)):
     else:
         outcome, mult = "lose", 0.0
 
-    win_cents = int(round(bet_cents * mult))
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * mult))
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "rps")
     return {
         "bot_choice": bot_choice,
         "outcome": outcome,
@@ -1522,14 +1811,14 @@ async def play_rps(req: RpsRequest, user: dict = Depends(get_current_user)):
 # =========================================================
 @app.post("/api/play/penalty")
 async def play_penalty(req: PenaltyRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     zones = [0, 1, 2, 3, 4]
     blocks = 2 if req.difficulty == "normal" else 3
     keeper_zones = [zones.pop(secrets.randbelow(len(zones))) for _ in range(blocks)]
     is_goal = req.zone not in keeper_zones
     mult = 1.55 if req.difficulty == "normal" else 2.30
-    win_cents = int(round(bet_cents * mult)) if is_goal else 0
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * mult)) if is_goal else 0
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "penalty")
     return {
         "keeper_zones": keeper_zones,
         "is_goal": is_goal,
@@ -1555,7 +1844,7 @@ SCRATCH_FILLERS = ["🍋", "🍒", "🔔", "💎", "👑", "🍀"]
 
 @app.post("/api/play/scratch")
 async def play_scratch(req: BetRequest, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     roll = secrets.randbelow(1000)
     acc = 0
     win_sym, mult = None, 0.0
@@ -1585,8 +1874,8 @@ async def play_scratch(req: BetRequest, user: dict = Depends(get_current_user)):
         j = secrets.randbelow(i + 1)
         grid[i], grid[j] = grid[j], grid[i]
 
-    win_cents = int(round(bet_cents * mult))
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * mult))
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "scratch")
     return {
         "grid": grid,
         "win_symbol": win_sym,
@@ -1601,7 +1890,7 @@ async def play_scratch(req: BetRequest, user: dict = Depends(get_current_user)):
 # =========================================================
 @app.post("/api/play/dice7")
 async def play_dice7(req: Dice7Request, user: dict = Depends(get_current_user)):
-    bet_cents = to_cents(req.bet)
+    bet_cents = validate_bet_cents(req.bet)
     d1 = secrets.randbelow(6) + 1
     d2 = secrets.randbelow(6) + 1
     total = d1 + d2
@@ -1615,8 +1904,8 @@ async def play_dice7(req: Dice7Request, user: dict = Depends(get_current_user)):
     else:
         is_win, mult = (d1 == d2), 5.50
 
-    win_cents = int(round(bet_cents * mult)) if is_win else 0
-    new_bal_cents = await settle_instant_game(user["user_id"], bet_cents, win_cents)
+    raw_win = int(round(bet_cents * mult)) if is_win else 0
+    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "dice7")
     return {
         "d1": d1,
         "d2": d2,
@@ -1629,7 +1918,7 @@ async def play_dice7(req: Dice7Request, user: dict = Depends(get_current_user)):
 
 
 # =========================================================
-# АДМИН-ПАНЕЛЬ (расширенная статистика)
+# АДМИН-ПАНЕЛЬ (расширенная статистика + атомарные правки)
 # =========================================================
 def require_admin(user: dict = Depends(get_current_user)) -> dict:
     if not ADMIN_ID or user["user_id"] != ADMIN_ID:
@@ -1728,45 +2017,45 @@ async def admin_overview(admin: dict = Depends(require_admin)):
 async def admin_change_balance(req: AdminBalanceRequest, admin: dict = Depends(require_admin)):
     amount_cents = to_cents(req.amount)
     async with db.pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT balance_cents FROM users WHERE user_id = $1", req.target_user_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="Игрок с таким ID не найден в базе")
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT balance_cents FROM users WHERE user_id = $1 FOR UPDATE",
+                req.target_user_id,
+            )
+            if not row:
+                raise HTTPException(status_code=404, detail="Игрок с таким ID не найден в базе")
 
-        cur = int(row["balance_cents"])
-        if req.mode == "add":
-            new_bal_cents = cur + amount_cents
-        elif req.mode == "sub":
-            new_bal_cents = max(0, cur - amount_cents)
-        else:
-            new_bal_cents = amount_cents
+            cur = int(row["balance_cents"])
+            if req.mode == "add":
+                new_bal_cents = cur + amount_cents
+            elif req.mode == "sub":
+                new_bal_cents = max(0, cur - amount_cents)
+            else:
+                new_bal_cents = amount_cents
 
-        await conn.execute("UPDATE users SET balance_cents = $1 WHERE user_id = $2", new_bal_cents, req.target_user_id)
+            delta = new_bal_cents - cur
+            await conn.execute(
+                "UPDATE users SET balance_cents = $1 WHERE user_id = $2",
+                new_bal_cents,
+                req.target_user_id,
+            )
+            await db.log_transaction(
+                conn,
+                req.target_user_id,
+                f"admin_{req.mode}",
+                delta,
+                new_bal_cents,
+                f"by_admin:{admin['user_id']}",
+            )
 
     return {"user_id": req.target_user_id, "balance": to_dollars(new_bal_cents)}
 
 
 @app.post("/api/admin/withdraw/handle")
 async def admin_handle_withdraw(req: AdminWithdrawHandleRequest, admin: dict = Depends(require_admin)):
-    new_status = "approved" if req.action == "approve" else "rejected"
-    async with db.pool.acquire() as conn:
-        async with conn.transaction():
-            wd = await conn.fetchrow("SELECT * FROM withdrawals WHERE id = $1 FOR UPDATE", req.wd_id)
-            if not wd:
-                raise HTTPException(status_code=404, detail="Заявка не найдена")
-            if wd["status"] != "pending":
-                raise HTTPException(status_code=400, detail="Заявка уже обработана")
+    res = await db.handle_withdrawal_decision(req.wd_id, req.action)
+    if not res["ok"]:
+        raise HTTPException(status_code=res["code"], detail=res["error"])
 
-            await conn.execute("UPDATE withdrawals SET status = $1 WHERE id = $2", new_status, req.wd_id)
-
-            usd = to_dollars(wd["amount_cents"])
-            if req.action == "approve":
-                user_msg = f"✅ Ваша заявка на вывод #{req.wd_id} (${usd:.2f}) одобрена и выплачена!"
-            else:
-                await conn.execute(
-                    "UPDATE users SET balance_cents = balance_cents + $1 WHERE user_id = $2",
-                    wd["amount_cents"], wd["user_id"],
-                )
-                user_msg = f"❌ Ваша заявка на вывод #{req.wd_id} (${usd:.2f}) отклонена. Средства возвращены на баланс."
-
-    send_tg_message(wd["user_id"], user_msg)
+    await send_tg_message(res["user_id"], res["user_msg"])
     return {"ok": True, "wd_id": req.wd_id, "action": req.action}
