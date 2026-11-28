@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl, urlparse
 import aiohttp
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -78,8 +79,9 @@ async def lifespan(app: FastAPI):
         await db.close_db()
 
 
-app = FastAPI(title="T Casino Mini App v2.2", lifespan=lifespan)
+app = FastAPI(title="T Casino Mini App v2.3", lifespan=lifespan)
 
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
@@ -90,10 +92,15 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def add_security_headers(request: Request, call_next):
+async def add_security_and_cache_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
+    path = request.url.path
+    if path.startswith("/static/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif path == "/":
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
