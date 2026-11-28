@@ -60,6 +60,8 @@ def _build_allowed_origins() -> list[str]:
 
 
 ALLOWED_ORIGINS = _build_allowed_origins()
+if not ALLOWED_ORIGINS:
+    logger.warning("WEBAPP_URL / ALLOWED_ORIGINS not set — CORS falls back to wildcard '*'")
 
 
 @asynccontextmanager
@@ -76,7 +78,7 @@ async def lifespan(app: FastAPI):
         await db.close_db()
 
 
-app = FastAPI(title="T Casino Mini App v2.1", lifespan=lifespan)
+app = FastAPI(title="T Casino Mini App v2.2", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -103,8 +105,18 @@ if os.path.isdir("static"):
 _rate_buckets: dict[tuple[str, int], collections.deque[float]] = collections.defaultdict(collections.deque)
 
 
+_rl_last_prune = 0.0
+
+
 def check_rate_limit(scope: str, user_id: int, limit: int, window_sec: float):
+    global _rl_last_prune
     now = time.monotonic()
+    if len(_rate_buckets) > 500 and now - _rl_last_prune > 60.0:
+        _rl_last_prune = now
+        stale_keys = [k for k, dq in _rate_buckets.items() if not dq or now - dq[-1] > 120.0]
+        for k in stale_keys:
+            _rate_buckets.pop(k, None)
+
     q = _rate_buckets[(scope, user_id)]
     while q and now - q[0] > window_sec:
         q.popleft()
@@ -252,12 +264,13 @@ async def settle_instant_game(
     bet_cents: int,
     win_cents: int,
     game_name: str,
+    games_inc: int = 1,
 ) -> tuple[int, int]:
     """Атомарно списывает ставку, начисляет выигрыш и пишет запись в ledger за 1 SQL round-trip."""
     check_rate_limit("play", user_id, limit=45, window_sec=10.0)
     capped_win = cap_win(win_cents)
     net_cents = capped_win - bet_cents
-    meta = f"{game_name}:bet={bet_cents}:win={capped_win}"
+    meta = f"{game_name}:bet={bet_cents}:win={capped_win}:n={games_inc}"
 
     async with db.pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -265,7 +278,7 @@ async def settle_instant_game(
             WITH updated AS (
                 UPDATE users
                 SET balance_cents = balance_cents - $1 + $2,
-                    games_played = games_played + 1,
+                    games_played = games_played + $7,
                     total_wagered_cents = total_wagered_cents + $1,
                     total_won_cents = total_won_cents + $2
                 WHERE user_id = $3 AND balance_cents >= $1
@@ -281,6 +294,7 @@ async def settle_instant_game(
             f"play_{game_name}",
             net_cents,
             meta,
+            max(1, int(games_inc)),
         )
         if not row:
             raise HTTPException(status_code=400, detail="Недостаточно средств. Пополните баланс в Кассе!")
@@ -409,6 +423,7 @@ class HiloRequest(BetRequest):
 
 class PlinkoRequest(BetRequest):
     risk: str = Field(default="medium", pattern="^(low|medium|high)$")
+    balls: int = Field(default=1, ge=1, le=50)
 
 
 class TowerStartRequest(BetRequest):
@@ -463,12 +478,12 @@ class WithdrawRequest(BaseModel):
 
 
 # --- Основные маршруты ---
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def serve_index():
     return FileResponse("static/index.html")
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     try:
         async with db.pool.acquire() as conn:
@@ -1190,16 +1205,50 @@ PLINKO_BUCKETS = {
 @app.post("/api/play/plinko")
 async def play_plinko(req: PlinkoRequest, user: dict = Depends(get_current_user)):
     bet_cents = validate_bet_cents(req.bet)
-    path = [secrets.randbelow(2) for _ in range(8)]  # 0 = лево, 1 = право
-    bucket = sum(path)
-    mult = PLINKO_BUCKETS[req.risk][bucket]
-    raw_win = int(round(bet_cents * mult))
-    new_bal_cents, win_cents = await settle_instant_game(user["user_id"], bet_cents, raw_win, "plinko")
+    balls = req.balls
+    total_bet_cents = bet_cents * balls
+    if total_bet_cents > MAX_BET_CENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Сумма ({balls} × ${to_dollars(bet_cents):.2f} = ${to_dollars(total_bet_cents):.2f}) превышает лимит ${MAX_BET_USD:.2f}",
+        )
+
+    buckets_cfg = PLINKO_BUCKETS[req.risk]
+    drops = []
+    remaining_cap = MAX_WIN_CENTS
+    total_win_cents = 0
+
+    for _ in range(balls):
+        path = [secrets.randbelow(2) for _ in range(8)]  # 0 = лево, 1 = право
+        bucket = sum(path)
+        mult = buckets_cfg[bucket]
+        raw_win = int(round(bet_cents * mult))
+        drop_win_cents = min(raw_win, remaining_cap)
+        remaining_cap = max(0, remaining_cap - drop_win_cents)
+        total_win_cents += drop_win_cents
+        drops.append({
+            "path": path,
+            "bucket": bucket,
+            "multiplier": mult,
+            "win": to_dollars(drop_win_cents),
+        })
+
+    new_bal_cents, settled_win_cents = await settle_instant_game(
+        user["user_id"], total_bet_cents, total_win_cents, "plinko", games_inc=balls
+    )
+    first = drops[0]
     return {
-        "path": path,
-        "bucket": bucket,
-        "multiplier": mult,
-        "win": to_dollars(win_cents),
+        "balls": balls,
+        "risk": req.risk,
+        "bet_per_ball": to_dollars(bet_cents),
+        "total_bet": to_dollars(total_bet_cents),
+        "total_win": to_dollars(settled_win_cents),
+        "drops": drops,
+        # Обратная совместимость для одиночного броска
+        "path": first["path"],
+        "bucket": first["bucket"],
+        "multiplier": first["multiplier"],
+        "win": to_dollars(settled_win_cents),
         "balance": to_dollars(new_bal_cents),
     }
 
@@ -1529,19 +1578,26 @@ async def blackjack_start(req: BetRequest, user: dict = Depends(get_current_user
             p_sc = bj_score(p_hand)
             d_sc = bj_score(d_hand)
 
-            if p_sc == 21:
-                if d_sc == 21:
+            if p_sc == 21 or d_sc == 21:
+                if p_sc == 21 and d_sc == 21:
                     win_cents = bet_cents
                     outcome = "push"
-                else:
+                elif p_sc == 21:
                     win_cents = cap_win(int(round(bet_cents * 2.4)))
                     outcome = "blackjack"
-                u_row = await conn.fetchrow(
-                    "UPDATE users SET balance_cents = balance_cents + $1, total_won_cents = total_won_cents + $1 WHERE user_id = $2 RETURNING balance_cents",
-                    win_cents, uid,
-                )
-                new_bal = int(u_row["balance_cents"])
-                await db.log_transaction(conn, uid, f"bj_{outcome}", win_cents, new_bal)
+                else:
+                    win_cents = 0
+                    outcome = "lose"
+
+                if win_cents > 0:
+                    u_row = await conn.fetchrow(
+                        "UPDATE users SET balance_cents = balance_cents + $1, total_won_cents = total_won_cents + $1 WHERE user_id = $2 RETURNING balance_cents",
+                        win_cents, uid,
+                    )
+                    new_bal = int(u_row["balance_cents"])
+                    await db.log_transaction(conn, uid, f"bj_{outcome}", win_cents, new_bal)
+                else:
+                    new_bal = bal_cents
                 return {
                     "status": "finished",
                     "outcome": outcome,
